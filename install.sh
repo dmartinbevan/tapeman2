@@ -24,6 +24,8 @@ mkdir -p /var/lib/tapeman2
 mkdir -p /var/log/tapeman2
 mkdir -p /data/staging
 mkdir -p /data/restore
+mkdir -p /mnt/tape
+chmod 777 /mnt/tape
 
 # Ensure tape group exists
 if ! getent group tape &>/dev/null; then

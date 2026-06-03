@@ -68,17 +68,19 @@ def pause():
 def header(subtitle=""):
     clear()
     if RICH:
-        console.print(Panel.fit(
-            f"[bold cyan]TapeMan 2[/bold cyan]  [dim]Quantum LTO-9 Archive Manager[/dim]\n"
-            f"[dim]{subtitle}[/dim]" if subtitle else
-            "[bold cyan]TapeMan 2[/bold cyan]  [dim]Quantum LTO-9 Archive Manager[/dim]",
-            border_style="cyan"
-        ))
+        # Use ANSI directly for reliable color rendering
+        title = (
+            "\033[1;36mTapeMan 2\033[0m"
+            "  \033[2mQuantum LTO-9 Archive Manager\033[0m"
+        )
+        if subtitle:
+            title += "\n\033[2m{}\033[0m".format(subtitle)
+        console.print(Panel.fit(title, border_style="cyan"))
     else:
         print("=" * 60)
         print("  TapeMan 2 — Quantum LTO-9 Archive Manager")
         if subtitle:
-            print(f"  {subtitle}")
+            print("  {}".format(subtitle))
         print("=" * 60)
     print()
 
@@ -1298,65 +1300,137 @@ def _check_permissions():
     sys.exit(1)
 
 
-def _input_with_timeout(timeout=60):
+def _wait_with_countdown(timeout=60):
     """
-    Wait for input with a timeout. Returns input string or None if timed out.
-    Displays a live countdown in the status area while waiting.
+    Wait for input while showing a live countdown in the status area.
+    Returns input string or None on timeout.
     """
     import select
     import sys
     import time
 
-    sys.stdout.write("  Enter choice: ")
-    sys.stdout.flush()
-
-    start    = time.time()
-    deadline = start + timeout
+    deadline = time.time() + timeout
 
     while True:
         remaining = int(deadline - time.time())
         if remaining <= 0:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
             return None
 
-        # Update countdown on same line after the prompt
-        # Use ANSI: save cursor, move to start of line, rewrite, restore
-        countdown = "  [status updates in {}s]".format(remaining)
-        # Write countdown on the line below the prompt
-        sys.stdout.write("\r\033[2K  Enter choice: ")
+        # Overwrite the countdown line in place (single line, no scroll)
+        if RICH:
+            sys.stdout.write(
+                "\r  \033[2K\033[36m↻\033[0m  \033[2mStatus refresh in {}s\033[0m  "
+                "  \033[36mEnter choice:\033[0m ".format(remaining))
+        else:
+            sys.stdout.write(
+                "\r  Status refresh in {}s    Enter choice: ".format(remaining))
         sys.stdout.flush()
 
-        # Check for input with 1-second poll
         ready, _, _ = select.select([sys.stdin], [], [], 1.0)
         if ready:
-            line = sys.stdin.readline().strip().lower()
             sys.stdout.write("\n")
-            return line
+            sys.stdout.flush()
+            line = sys.stdin.readline().strip().lower()
+            return line if line else None
 
     return None
+
+
+def _clear_countdown():
+    import sys
+    sys.stdout.write("\r" + " " * 70 + "\r")
+    sys.stdout.flush()
+
+
+def status_line():
+    mounted = core.is_mounted(MOUNT)
+    plat    = core._get_platform()
+
+    if RICH:
+        if mounted:
+            free_str = _tape_free_nonblocking()
+            console.print(
+                "  \033[32m●\033[0m  \033[1mTape:\033[0m  "
+                "\033[32mMounted at {}\033[0m  \033[2m({})\033[0m".format(
+                    MOUNT, free_str))
+        else:
+            state, msg = core.tape_drive_state(ST, SG)
+            if state == plat.TAPE_STATE_INITIALIZING:
+                console.print(
+                    "  \033[33m⏳\033[0m  \033[1mTape:\033[0m  "
+                    "\033[33mInitializing\033[0m  \033[2m— {}\033[0m".format(msg))
+            elif state == plat.TAPE_STATE_NO_TAPE:
+                console.print(
+                    "  \033[2m○\033[0m  \033[1mTape:\033[0m  "
+                    "\033[2mNo tape loaded\033[0m")
+            elif state == plat.TAPE_STATE_NOT_READY:
+                console.print(
+                    "  \033[33m○\033[0m  \033[1mTape:\033[0m  "
+                    "\033[33mNot ready — loading...\033[0m")
+            else:
+                console.print(
+                    "  \033[33m○\033[0m  \033[1mTape:\033[0m  "
+                    "\033[2mNot mounted\033[0m")
+    else:
+        if mounted:
+            free_str = _tape_free_nonblocking()
+            print("  Tape: MOUNTED at {} ({})".format(MOUNT, free_str))
+        else:
+            state, msg = core.tape_drive_state(ST, SG)
+            if state == plat.TAPE_STATE_INITIALIZING:
+                print("  Tape: INITIALIZING — {}".format(msg))
+            elif state == plat.TAPE_STATE_NO_TAPE:
+                print("  Tape: no tape loaded")
+            elif state == plat.TAPE_STATE_NOT_READY:
+                print("  Tape: not ready — loading...")
+            else:
+                print("  Tape: not mounted")
+
+    # Active jobs
+    active = core.active_job_count(STATE_DIR)
+    if active:
+        console.print(
+            "  \033[36m⚙\033[0m  \033[1mJobs:\033[0m  "
+            "\033[36m{} job{} running\033[0m".format(
+                active, "s" if active != 1 else "")) if RICH else \
+        print("  Jobs: {} job{} running".format(active, "s" if active != 1 else ""))
+
+    # Cleaning warning
+    needs_clean, clean_msg = _cleaning_status_nonblocking()
+    if needs_clean:
+        console.print(
+            "  \033[31m⚠\033[0m  \033[1;31mDrive cleaning required\033[0m  "
+            "\033[2m— {}\033[0m".format(clean_msg)) if RICH else \
+        print("  *** DRIVE CLEANING REQUIRED — {} ***".format(clean_msg))
+
+    print()
 
 
 def main():
     _check_permissions()
 
-    REFRESH_INTERVAL = 60  # seconds between auto-refreshes
+    REFRESH_INTERVAL = 60
 
     while True:
-        import time
         header()
         status_line()
 
         if RICH:
-            console.print("  [bold]Main Menu[/bold]\n")
-            console.print("  [cyan]1[/cyan])  Archive a dataset")
-            console.print("  [cyan]2[/cyan])  Restore a dataset")
-            console.print("  [cyan]3[/cyan])  Verify archives")
-            console.print("  [cyan]4[/cyan])  Browse inventory & search")
-            console.print("  [cyan]5[/cyan])  Tape management (mount / unmount / format)")
-            console.print("  [cyan]6[/cyan])  Jobs (background archive/restore/verify)")
-            console.print("  [cyan]7[/cyan])  Library / changer management")
-            console.print("  [cyan]q[/cyan])  Quit")
+            # Menu with better color scheme
+            console.print("  \033[1mMain Menu\033[0m\n")
+            items = [
+                ("1", "Archive a dataset"),
+                ("2", "Restore a dataset"),
+                ("3", "Verify archives"),
+                ("4", "Browse inventory & search"),
+                ("5", "Tape management  (mount / unmount / format)"),
+                ("6", "Jobs  (background archive / restore / verify)"),
+                ("7", "Library / changer management"),
+                ("q", "Quit"),
+            ]
+            for k, label in items:
+                console.print(
+                    "  \033[36m{}\033[0m\033[2m)\033[0m  {}".format(k, label))
             console.print()
         else:
             print("  Main Menu\n")
@@ -1368,11 +1442,10 @@ def main():
                 print("  {})  {}".format(k, l))
             print()
 
-        # Show countdown and wait for input
         choice = _wait_with_countdown(REFRESH_INTERVAL)
 
         if choice is None:
-            continue  # timed out — redraw with fresh status
+            continue
 
         if choice == "1":
             do_archive()
@@ -1390,69 +1463,10 @@ def main():
             do_library()
         elif choice in ("q", "quit", "exit"):
             if RICH:
-                console.print("\n  [dim]Goodbye.[/dim]\n")
+                console.print("\n  \033[2mGoodbye.\033[0m\n")
             else:
                 print("\n  Goodbye.\n")
             sys.exit(0)
-
-
-def _wait_with_countdown(timeout=60):
-    """
-    Wait for input while showing a live countdown.
-    Returns input string or None on timeout.
-    Countdown appears as a status line that ticks down each second.
-    """
-    import select
-    import sys
-    import time
-
-    deadline = time.time() + timeout
-
-    # Print initial countdown line
-    _write_countdown(int(timeout))
-    sys.stdout.flush()
-
-    while True:
-        remaining = int(deadline - time.time())
-        if remaining <= 0:
-            _clear_countdown()
-            return None
-
-        # Update countdown in place
-        _write_countdown(remaining)
-
-        # Poll for input with 1-second granularity
-        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
-        if ready:
-            _clear_countdown()
-            # Print a clean prompt and read
-            sys.stdout.write("  Enter choice: ")
-            sys.stdout.flush()
-            line = sys.stdin.readline().strip().lower()
-            return line if line else None
-
-    return None
-
-
-def _write_countdown(remaining):
-    """Write/overwrite the countdown line in place."""
-    import sys
-    if RICH:
-        # Use ANSI escape to overwrite current line
-        msg = "\r  [dim]Enter choice — status updates in {}s...[/dim]  ".format(
-            remaining)
-        sys.stdout.write(msg)
-    else:
-        msg = "\r  Enter choice — status updates in {}s...  ".format(remaining)
-        sys.stdout.write(msg)
-    sys.stdout.flush()
-
-
-def _clear_countdown():
-    """Clear the countdown line."""
-    import sys
-    sys.stdout.write("\r" + " " * 60 + "\r")
-    sys.stdout.flush()
 
 if __name__ == "__main__":
     main()

@@ -1,39 +1,12 @@
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.egg-info/
-dist/
-build/
-
-# Database — never commit live DB
 *.db
 *.db-wal
 *.db-shm
-
-# Logs
 *.log
-logs/
-
-# Job files — runtime state, not source
 jobs/
-
-# Config with local overrides — commit templates only
 tapeman2.conf.local
-tapeman2-mac.conf.local
-
-# macOS
 .DS_Store
-.AppleDouble
-.LSOverride
-
-# Editor
-.vscode/
-.idea/
 *.swp
-*.swo
-*~
-
-# Zip artifacts
 *.zip
 *.tar.gz

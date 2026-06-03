@@ -121,12 +121,14 @@ cp "$SCRIPT_DIR/tapeman2_platform_mac.py"    /usr/local/lib/tapeman2/tapeman2_pl
 cp "$SCRIPT_DIR/tapeman2"                    /usr/local/bin/tapeman2
 cp "$SCRIPT_DIR/tapeman2-gui"               /usr/local/bin/tapeman2-gui
 cp "$SCRIPT_DIR/tapeman2-setup"             /usr/local/bin/tapeman2-setup
+cp "$SCRIPT_DIR/tapeman2-update"            /usr/local/bin/tapeman2-update
 
 # ── Permissions ───────────────────────────────────────────────────────────────
 echo "Setting permissions..."
 chmod 755 /usr/local/bin/tapeman2
 chmod 755 /usr/local/bin/tapeman2-gui
 chmod 755 /usr/local/bin/tapeman2-setup
+chmod 755 /usr/local/bin/tapeman2-update
 chmod 644 /usr/local/lib/tapeman2/tapeman2_core.py
 chmod 644 /usr/local/lib/tapeman2/tapeman2_changer.py
 chmod 644 /usr/local/lib/tapeman2/tapeman2_platform_linux.py
@@ -181,6 +183,7 @@ echo "  Next step:  tapeman2-setup"
 echo ""
 echo "  TUI:        tapeman2"
 echo "  GUI:        tapeman2-gui  (requires SSH -Y or local display)"
+echo "  Update:     sudo tapeman2-update"
 echo ""
 echo "  Config:     /etc/tapeman2/tapeman2.conf"
 echo "  Database:   /var/lib/tapeman2/archives.db"

@@ -200,10 +200,16 @@ def mount_tape(sg_device, mount_point, progress_cb=None, st_device=None):
         timeout=120
     )
     if not is_mounted(mount_point):
+        stderr = result.stderr + result.stdout
+        if "not partitioned" in stderr or "medium is not partitioned" in stderr:
+            raise RuntimeError(
+                "Tape is not formatted with LTFS.\n"
+                "Format it first via Tape Management → Format tape.\n"
+                "(Warning: formatting erases all data on the tape.)")
+        if "no medium" in stderr.lower() or "no tape" in stderr.lower():
+            raise RuntimeError("No tape loaded. Please insert a cartridge.")
         raise RuntimeError("Failed to mount tape:\n{}\n{}".format(
             result.stderr, result.stdout))
-
-# ── Cleaning Detection ────────────────────────────────────────────────────────
 
 # TapeAlert log page (0x2e) flag meanings we care about
 _TAPEALERT_CLEAN_FLAGS = {

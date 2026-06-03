@@ -105,16 +105,14 @@ def tape_drive_state(st_device, sg_device=None):
     result = run_cmd(["mt", "-f", st_device, "status"], timeout=10)
     if result.returncode == 0:
         out = result.stdout.upper()
-        raw = result.stdout.lower()
 
         if "DR_OPEN" in out and "ONLINE" not in out:
             return TAPE_STATE_NO_TAPE, "No tape loaded in drive"
 
+        # ONLINE means the tape is loaded and ready — block number is
+        # often -1 on LTO drives even when fully ready, so don't check it
         if "ONLINE" in out:
-            m = re.search(r"block number=(-?\d+)", raw)
-            if m and int(m.group(1)) >= 0:
-                return TAPE_STATE_READY, "Tape ready"
-            return TAPE_STATE_NOT_READY, "Tape loading..."
+            return TAPE_STATE_READY, "Tape ready"
 
         if "NOT READY" in out or "ILI" in out:
             return TAPE_STATE_NOT_READY, "Drive not ready"

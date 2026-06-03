@@ -81,32 +81,49 @@ def header(subtitle=""):
         print("=" * 60)
     print()
 
-def status_line():
+def status_line(countdown=None):
     mounted = core.is_mounted(MOUNT)
+    plat    = core._get_platform()
+
     if RICH:
         if mounted:
             free_str = _tape_free_nonblocking()
-            console.print("  Tape: [green]● Mounted at {}[/green]  "
-                          "[dim]({})[/dim]".format(MOUNT, free_str))
+            console.print("  [green]●[/green]  [bold]Tape:[/bold]  "
+                          "[green]Mounted at {}[/green]  [dim]({})[/dim]".format(
+                              MOUNT, free_str))
         else:
-            # Check drive state for helpful message
             state, msg = core.tape_drive_state(ST, SG)
-            plat = core._get_platform()
             if state == plat.TAPE_STATE_INITIALIZING:
-                console.print("  Tape: [yellow]⏳ Initializing — {}[/yellow]".format(msg))
+                console.print("  [yellow]⏳[/yellow]  [bold]Tape:[/bold]  "
+                              "[yellow]Initializing[/yellow]  [dim]— {}[/dim]".format(msg))
             elif state == plat.TAPE_STATE_NO_TAPE:
-                console.print("  Tape: [dim]○ No tape loaded[/dim]")
+                console.print("  [dim]○[/dim]  [bold]Tape:[/bold]  [dim]No tape loaded[/dim]")
             elif state == plat.TAPE_STATE_NOT_READY:
-                console.print("  Tape: [yellow]○ Not ready — loading...[/yellow]")
+                console.print("  [yellow]○[/yellow]  [bold]Tape:[/bold]  "
+                              "[yellow]Not ready — loading...[/yellow]")
             else:
-                console.print("  Tape: [yellow]○ Not mounted[/yellow]")
+                console.print("  [yellow]○[/yellow]  [bold]Tape:[/bold]  [dim]Not mounted[/dim]")
+
+        active = core.active_job_count(STATE_DIR)
+        if active:
+            console.print("  [cyan]⚙[/cyan]  [bold]Jobs:[/bold]  "
+                          "[cyan]{} job{} running[/cyan]".format(
+                              active, "s" if active != 1 else ""))
+
+        needs_clean, clean_msg = _cleaning_status_nonblocking()
+        if needs_clean:
+            console.print("  [bold red]⚠[/bold red]  [bold red]DRIVE CLEANING "
+                          "REQUIRED[/bold red]  [dim]— {}[/dim]".format(clean_msg))
+
+        if countdown is not None:
+            console.print("  [dim]↻  Status refresh in {}s[/dim]".format(countdown))
+
     else:
         if mounted:
             free_str = _tape_free_nonblocking()
             print("  Tape: MOUNTED at {} ({})".format(MOUNT, free_str))
         else:
             state, msg = core.tape_drive_state(ST, SG)
-            plat = core._get_platform()
             if state == plat.TAPE_STATE_INITIALIZING:
                 print("  Tape: INITIALIZING — {}".format(msg))
             elif state == plat.TAPE_STATE_NO_TAPE:
@@ -116,24 +133,18 @@ def status_line():
             else:
                 print("  Tape: not mounted")
 
-    # Active jobs
-    active = core.active_job_count(STATE_DIR)
-    if active:
-        if RICH:
-            console.print("  Jobs: [cyan]⚙ {} job{} running[/cyan]".format(
-                active, "s" if active != 1 else ""))
-        else:
+        active = core.active_job_count(STATE_DIR)
+        if active:
             print("  Jobs: {} job{} running".format(
                 active, "s" if active != 1 else ""))
 
-    # Cleaning status
-    needs_clean, clean_msg = _cleaning_status_nonblocking()
-    if needs_clean:
-        if RICH:
-            console.print("  Drive: [bold red]⚠  CLEANING REQUIRED — {}[/bold red]".format(
-                clean_msg))
-        else:
-            print("  Drive: *** CLEANING REQUIRED — {} ***".format(clean_msg))
+        needs_clean, clean_msg = _cleaning_status_nonblocking()
+        if needs_clean:
+            print("  *** DRIVE CLEANING REQUIRED — {} ***".format(clean_msg))
+
+        if countdown is not None:
+            print("  Status refresh in {}s".format(countdown))
+
     print()
 
 def _cleaning_status_nonblocking():
@@ -1297,145 +1308,76 @@ def _check_permissions():
     sys.exit(1)
 
 
-def _wait_with_countdown(timeout=60):
-    """
-    Wait for input while showing a live countdown in the status area.
-    Returns input string or None on timeout.
-    """
-    import select
-    import sys
-    import time
-
-    deadline = time.time() + timeout
-
-    while True:
-        remaining = int(deadline - time.time())
-        if remaining <= 0:
-            return None
-
-        # Overwrite countdown line in place using plain stdout
-        # (rich console can't do \r overwrite, plain text works fine here)
-        sys.stdout.write(
-            "\r  ↻ Status refresh in {:2d}s    Enter choice: ".format(remaining))
-        sys.stdout.flush()
-
-        ready, _, _ = select.select([sys.stdin], [], [], 1.0)
-        if ready:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            line = sys.stdin.readline().strip().lower()
-            return line if line else None
-
-    return None
-
-
-def _clear_countdown():
-    import sys
-    sys.stdout.write("\r" + " " * 70 + "\r")
-    sys.stdout.flush()
-
-
-def status_line():
-    mounted = core.is_mounted(MOUNT)
-    plat    = core._get_platform()
+def _draw_main_menu(remaining):
+    """Draw the full main menu screen including countdown in status area."""
+    header()
+    status_line(countdown=remaining)
 
     if RICH:
-        if mounted:
-            free_str = _tape_free_nonblocking()
-            console.print("  [green]●[/green]  [bold]Tape:[/bold]  "
-                          "[green]Mounted at {}[/green]  [dim]({})[/dim]".format(
-                              MOUNT, free_str))
-        else:
-            state, msg = core.tape_drive_state(ST, SG)
-            if state == plat.TAPE_STATE_INITIALIZING:
-                console.print("  [yellow]⏳[/yellow]  [bold]Tape:[/bold]  "
-                              "[yellow]Initializing[/yellow]  "
-                              "[dim]— {}[/dim]".format(msg))
-            elif state == plat.TAPE_STATE_NO_TAPE:
-                console.print("  [dim]○[/dim]  [bold]Tape:[/bold]  "
-                              "[dim]No tape loaded[/dim]")
-            elif state == plat.TAPE_STATE_NOT_READY:
-                console.print("  [yellow]○[/yellow]  [bold]Tape:[/bold]  "
-                              "[yellow]Not ready — loading...[/yellow]")
-            else:
-                console.print("  [yellow]○[/yellow]  [bold]Tape:[/bold]  "
-                              "[dim]Not mounted[/dim]")
-
-        # Active jobs
-        active = core.active_job_count(STATE_DIR)
-        if active:
-            console.print("  [cyan]⚙[/cyan]  [bold]Jobs:[/bold]  "
-                          "[cyan]{} job{} running[/cyan]".format(
-                              active, "s" if active != 1 else ""))
-
-        # Cleaning warning
-        needs_clean, clean_msg = _cleaning_status_nonblocking()
-        if needs_clean:
-            console.print("  [bold red]⚠[/bold red]  [bold red]Drive cleaning "
-                          "required[/bold red]  [dim]— {}[/dim]".format(clean_msg))
-
+        console.print("  [bold]Main Menu[/bold]\n")
+        for k, label in [
+            ("1", "Archive a dataset"),
+            ("2", "Restore a dataset"),
+            ("3", "Verify archives"),
+            ("4", "Browse inventory & search"),
+            ("5", "Tape management  (mount / unmount / format)"),
+            ("6", "Jobs  (background archive / restore / verify)"),
+            ("7", "Library / changer management"),
+            ("q", "Quit"),
+        ]:
+            console.print("  [cyan]{}[/cyan][dim])[/dim]  {}".format(k, label))
+        console.print()
+        console.print("  Enter choice: ", end="")
     else:
-        if mounted:
-            free_str = _tape_free_nonblocking()
-            print("  Tape: MOUNTED at {} ({})".format(MOUNT, free_str))
-        else:
-            state, msg = core.tape_drive_state(ST, SG)
-            if state == plat.TAPE_STATE_INITIALIZING:
-                print("  Tape: INITIALIZING — {}".format(msg))
-            elif state == plat.TAPE_STATE_NO_TAPE:
-                print("  Tape: no tape loaded")
-            elif state == plat.TAPE_STATE_NOT_READY:
-                print("  Tape: not ready — loading...")
-            else:
-                print("  Tape: not mounted")
-        active = core.active_job_count(STATE_DIR)
-        if active:
-            print("  Jobs: {} job{} running".format(
-                active, "s" if active != 1 else ""))
-        needs_clean, clean_msg = _cleaning_status_nonblocking()
-        if needs_clean:
-            print("  *** DRIVE CLEANING REQUIRED — {} ***".format(clean_msg))
-
-    print()
+        print("  Main Menu\n")
+        for k, l in [("1","Archive a dataset"),("2","Restore a dataset"),
+                      ("3","Verify archives"),("4","Browse inventory & search"),
+                      ("5","Tape management (mount / unmount / format)"),
+                      ("6","Jobs (background archive/restore/verify)"),
+                      ("7","Library / changer management"),("q","Quit")]:
+            print("  {})  {}".format(k, l))
+        print()
+        sys.stdout.write("  Enter choice: ")
+        sys.stdout.flush()
 
 
 def main():
+    import select
+    import time
+
     _check_permissions()
 
     REFRESH_INTERVAL = 60
 
     while True:
-        header()
-        status_line()
+        remaining = REFRESH_INTERVAL
+        deadline  = time.time() + REFRESH_INTERVAL
 
-        if RICH:
-            console.print("  [bold]Main Menu[/bold]\n")
-            items = [
-                ("1", "Archive a dataset"),
-                ("2", "Restore a dataset"),
-                ("3", "Verify archives"),
-                ("4", "Browse inventory & search"),
-                ("5", "Tape management  (mount / unmount / format)"),
-                ("6", "Jobs  (background archive / restore / verify)"),
-                ("7", "Library / changer management"),
-                ("q", "Quit"),
-            ]
-            for k, label in items:
-                console.print("  [cyan]{}[/cyan][dim])[/dim]  {}".format(k, label))
-            console.print()
-        else:
-            print("  Main Menu\n")
-            for k, l in [("1","Archive a dataset"),("2","Restore a dataset"),
-                          ("3","Verify archives"),("4","Browse inventory & search"),
-                          ("5","Tape management (mount / unmount / format)"),
-                          ("6","Jobs (background archive/restore/verify)"),
-                          ("7","Library / changer management"),("q","Quit")]:
-                print("  {})  {}".format(k, l))
-            print()
+        # Draw initial screen with full countdown
+        _draw_main_menu(remaining)
 
-        choice = _wait_with_countdown(REFRESH_INTERVAL)
+        choice = None
+        while choice is None:
+            remaining = max(0, int(deadline - time.time()))
+
+            # Poll for input — 1 second at a time
+            ready, _, _ = select.select([sys.stdin], [], [], 1.0)
+
+            if ready:
+                choice = sys.stdin.readline().strip().lower()
+                break
+
+            # Check if countdown expired — full redraw
+            if remaining <= 0:
+                break
+
+            # Redraw just the countdown line in the status area
+            # by redrawing the whole screen (clean, no cursor tricks)
+            if remaining % 5 == 0 or remaining <= 10:
+                _draw_main_menu(remaining)
 
         if choice is None:
+            # Timed out — full redraw next iteration
             continue
 
         if choice == "1":

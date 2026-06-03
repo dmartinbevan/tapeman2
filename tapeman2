@@ -1298,23 +1298,60 @@ def _check_permissions():
     sys.exit(1)
 
 
+def _input_with_timeout(prompt_str, timeout=10):
+    """
+    Show a prompt and wait for input. If no input arrives within
+    timeout seconds, return None (triggers a status refresh).
+    Uses select() for non-blocking input — works on Linux/Mac.
+    """
+    import select
+    import sys
+    sys.stdout.write(prompt_str)
+    sys.stdout.flush()
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if ready:
+        return sys.stdin.readline().strip().lower()
+    return None  # timed out — redraw
+
+
 def main():
     _check_permissions()
+
+    REFRESH_INTERVAL = 10  # seconds between auto-refreshes at main menu
 
     while True:
         header()
         status_line()
 
-        choice = show_menu("Main Menu", [
-            ("1", "Archive a dataset"),
-            ("2", "Restore a dataset"),
-            ("3", "Verify archives"),
-            ("4", "Browse inventory & search"),
-            ("5", "Tape management (mount / unmount / format)"),
-            ("6", "Jobs (background archive/restore/verify)"),
-            ("7", "Library / changer management"),
-            ("q", "Quit"),
-        ])
+        if RICH:
+            console.print("  [bold]Main Menu[/bold]\n")
+            console.print("  [cyan]1[/cyan])  Archive a dataset")
+            console.print("  [cyan]2[/cyan])  Restore a dataset")
+            console.print("  [cyan]3[/cyan])  Verify archives")
+            console.print("  [cyan]4[/cyan])  Browse inventory & search")
+            console.print("  [cyan]5[/cyan])  Tape management (mount / unmount / format)")
+            console.print("  [cyan]6[/cyan])  Jobs (background archive/restore/verify)")
+            console.print("  [cyan]7[/cyan])  Library / changer management")
+            console.print("  [cyan]q[/cyan])  Quit")
+            console.print()
+        else:
+            print("  Main Menu\n")
+            for k, l in [("1","Archive a dataset"),("2","Restore a dataset"),
+                          ("3","Verify archives"),("4","Browse inventory & search"),
+                          ("5","Tape management (mount / unmount / format)"),
+                          ("6","Jobs (background archive/restore/verify)"),
+                          ("7","Library / changer management"),("q","Quit")]:
+                print("  {})  {}".format(k, l))
+            print()
+
+        choice = _input_with_timeout(
+            "  Enter choice (auto-refreshes in {}s): ".format(REFRESH_INTERVAL),
+            timeout=REFRESH_INTERVAL
+        )
+
+        if choice is None:
+            # Timed out — just redraw (loop continues)
+            continue
 
         if choice == "1":
             do_archive()

@@ -114,14 +114,14 @@ echo "Copying tapeman2 files..."
 # Determine script directory so we can find our files
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-cp "$SCRIPT_DIR/tapeman2_core.py"            /usr/local/lib/tapeman2/tapeman2_core.py
-cp "$SCRIPT_DIR/tapeman2_changer.py"         /usr/local/lib/tapeman2/tapeman2_changer.py
-cp "$SCRIPT_DIR/tapeman2_platform_linux.py"  /usr/local/lib/tapeman2/tapeman2_platform_linux.py
-cp "$SCRIPT_DIR/tapeman2_platform_mac.py"    /usr/local/lib/tapeman2/tapeman2_platform_mac.py
-cp "$SCRIPT_DIR/tapeman2"                    /usr/local/bin/tapeman2
-cp "$SCRIPT_DIR/tapeman2-gui"               /usr/local/bin/tapeman2-gui
-cp "$SCRIPT_DIR/tapeman2-setup"             /usr/local/bin/tapeman2-setup
-cp "$SCRIPT_DIR/tapeman2-update"            /usr/local/bin/tapeman2-update
+cp "$SCRIPT_DIR/lib/tapeman2_core.py"            /usr/local/lib/tapeman2/tapeman2_core.py
+cp "$SCRIPT_DIR/lib/tapeman2_changer.py"         /usr/local/lib/tapeman2/tapeman2_changer.py
+cp "$SCRIPT_DIR/lib/tapeman2_platform_linux.py"  /usr/local/lib/tapeman2/tapeman2_platform_linux.py
+cp "$SCRIPT_DIR/lib/tapeman2_platform_mac.py"    /usr/local/lib/tapeman2/tapeman2_platform_mac.py
+cp "$SCRIPT_DIR/tapeman2"                        /usr/local/bin/tapeman2
+cp "$SCRIPT_DIR/tapeman2-gui"                    /usr/local/bin/tapeman2-gui
+cp "$SCRIPT_DIR/tapeman2-setup"                  /usr/local/bin/tapeman2-setup
+cp "$SCRIPT_DIR/tapeman2-update"                 /usr/local/bin/tapeman2-update
 
 # ── Permissions ───────────────────────────────────────────────────────────────
 echo "Setting permissions..."
@@ -158,7 +158,7 @@ echo "  udev rules installed."
 
 # ── Config ────────────────────────────────────────────────────────────────────
 if [ ! -f /etc/tapeman2/tapeman2.conf ]; then
-    cp "$SCRIPT_DIR/tapeman2.conf" /etc/tapeman2/tapeman2.conf
+    cp "$SCRIPT_DIR/conf/tapeman2.conf" /etc/tapeman2/tapeman2.conf
     echo "  Config installed at /etc/tapeman2/tapeman2.conf"
 else
     echo "  Config already exists — not overwriting."

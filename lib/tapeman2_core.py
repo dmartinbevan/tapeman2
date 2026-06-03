@@ -530,22 +530,29 @@ def checksum_tree(path, algo="sha256", progress_cb=None):
 
 # ── Preflight ─────────────────────────────────────────────────────────────────
 
-def preflight_check(source_path, staging_dir, mount_point, min_staging_free_gb):
+def preflight_check(source_path, staging_dir, mount_point, min_staging_free_gb,
+                    direct_write=False):
+    """
+    Preflight checks before archiving.
+    direct_write=True skips staging space checks — source is written directly to tape.
+    """
     errors = []
     if not os.path.exists(source_path):
         errors.append("Source path does not exist: {}".format(source_path))
         return errors
 
     src_size, _ = dir_size_and_count(source_path)
-    staging_free = free_bytes(staging_dir)
-    min_bytes = min_staging_free_gb * 1024 ** 3
 
-    if staging_free < min_bytes:
-        errors.append("Insufficient staging space: {} free, need {} GB minimum".format(
-            human_size(staging_free), min_staging_free_gb))
-    if staging_free < src_size * 1.1:
-        errors.append("Staging may not fit source ({} source, {} free)".format(
-            human_size(src_size), human_size(staging_free)))
+    if not direct_write:
+        staging_free = free_bytes(staging_dir)
+        min_bytes = min_staging_free_gb * 1024 ** 3
+        if staging_free < min_bytes:
+            errors.append("Insufficient staging space: {} free, need {} GB minimum".format(
+                human_size(staging_free), min_staging_free_gb))
+        if staging_free < src_size * 1.1:
+            errors.append("Staging may not fit source ({} source, {} free)".format(
+                human_size(src_size), human_size(staging_free)))
+
     if not is_mounted(mount_point):
         errors.append("Tape is not mounted.")
     else:
@@ -555,6 +562,182 @@ def preflight_check(source_path, staging_dir, mount_point, min_staging_free_gb):
                 human_size(src_size), human_size(tape_free)))
     return errors
 
+# ── Import Existing Tape ──────────────────────────────────────────────────────
+
+def scan_tape_contents(mount_point):
+    """
+    Scan a mounted LTFS tape and return a list of top-level directories/files.
+    Each entry: {name, path, size_bytes, file_count, is_dir}
+    """
+    contents = []
+    try:
+        for entry in sorted(os.listdir(mount_point)):
+            full = os.path.join(mount_point, entry)
+            if os.path.isdir(full):
+                size, count = dir_size_and_count(full)
+                contents.append({
+                    "name":       entry,
+                    "path":       full,
+                    "size_bytes": size,
+                    "file_count": count,
+                    "is_dir":     True,
+                })
+            elif os.path.isfile(full):
+                size = os.path.getsize(full)
+                contents.append({
+                    "name":       entry,
+                    "path":       full,
+                    "size_bytes": size,
+                    "file_count": 1,
+                    "is_dir":     False,
+                })
+    except Exception as e:
+        logging.getLogger("tapeman2").warning("scan_tape_contents: %s", e)
+    return contents
+
+def import_tape_entry(
+    tape_path,
+    tape_label,
+    db_path,
+    mount_point,
+    name,
+    lab="",
+    pi="",
+    notes="",
+    checksum_algo="sha256",
+    compute_checksum=True,
+    progress_cb=None,
+):
+    """
+    Register an existing dataset on a tape into the database.
+    Optionally computes a checksum by reading the tape (serves as a verify pass).
+
+    tape_path   — full path on the mounted tape e.g. /mnt/tape/MYDATA
+    tape_label  — label of the tape cartridge
+    """
+    def progress(msg):
+        if progress_cb:
+            progress_cb(msg)
+        logging.getLogger("tapeman2").info(msg)
+
+    if not os.path.exists(tape_path):
+        raise ArchiveError("Path not found on tape: {}".format(tape_path))
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Size and file count
+    if os.path.isdir(tape_path):
+        size_bytes, file_count = dir_size_and_count(tape_path)
+        is_tar = False
+    else:
+        size_bytes = os.path.getsize(tape_path)
+        file_count = 1
+        is_tar = tape_path.endswith(".tar")
+
+    # Determine tape_path relative to mount point for storage in DB
+    rel_path = "/" + os.path.relpath(tape_path, mount_point)
+
+    # Compute checksum if requested
+    checksum = ""
+    if compute_checksum:
+        progress("Computing checksum for {} ({})...".format(
+            name, human_size(size_bytes)))
+        if os.path.isdir(tape_path):
+            checksum = checksum_tree(tape_path, checksum_algo, progress_cb)
+        else:
+            checksum = checksum_file(tape_path, checksum_algo)
+        progress("Checksum: {}".format(checksum))
+
+    # Generate archive ID
+    archive_id = next_archive_id(db_path)
+
+    record = ArchiveRecord(
+        archive_id=archive_id,
+        name=name,
+        tape_label=tape_label,
+        tape_path=rel_path,
+        source_path="(imported — original source unknown)",
+        size_bytes=size_bytes,
+        file_count=file_count,
+        checksum_src=checksum,
+        checksum_tape=checksum,
+        date_archived=now,
+        status="verified" if compute_checksum else "archived",
+        lab=lab,
+        pi=pi,
+        notes=notes,
+        tar_bundle=is_tar,
+        date_verified=now if compute_checksum else "",
+    )
+
+    _db_upsert_tape(db_path, tape_label, size_bytes)
+    _db_insert_archive(db_path, record)
+    progress("✔ Registered as {} in database.".format(archive_id))
+    return record
+
+def import_full_tape(
+    tape_label,
+    db_path,
+    mount_point,
+    lab="",
+    pi="",
+    checksum_algo="sha256",
+    compute_checksum=True,
+    progress_cb=None,
+    entry_metadata=None,
+):
+    """
+    Import all top-level entries from a mounted tape into the database.
+
+    entry_metadata — optional dict mapping entry name to {name, lab, pi, notes}
+                     for per-entry overrides. If None, uses top-level dir name
+                     as dataset name.
+    Returns list of imported ArchiveRecords.
+    """
+    def progress(msg):
+        if progress_cb:
+            progress_cb(msg)
+
+    progress("Scanning tape {}...".format(tape_label))
+    contents = scan_tape_contents(mount_point)
+
+    if not contents:
+        raise ArchiveError("No entries found on tape at {}".format(mount_point))
+
+    progress("Found {} entries on tape.".format(len(contents)))
+    records = []
+
+    for entry in contents:
+        meta = (entry_metadata or {}).get(entry["name"], {})
+        name  = meta.get("name",  entry["name"])
+        elab  = meta.get("lab",   lab)
+        epi   = meta.get("pi",    pi)
+        enotes= meta.get("notes", "Imported from existing tape {}".format(tape_label))
+
+        progress("Importing: {} ({})...".format(
+            name, human_size(entry["size_bytes"])))
+
+        try:
+            rec = import_tape_entry(
+                tape_path=entry["path"],
+                tape_label=tape_label,
+                db_path=db_path,
+                mount_point=mount_point,
+                name=name,
+                lab=elab,
+                pi=epi,
+                notes=enotes,
+                checksum_algo=checksum_algo,
+                compute_checksum=compute_checksum,
+                progress_cb=progress_cb,
+            )
+            records.append(rec)
+        except Exception as e:
+            progress("  Error importing {}: {}".format(entry["name"], e))
+
+    progress("✔ Import complete — {} entries registered.".format(len(records)))
+    return records
+
 # ── Archive ───────────────────────────────────────────────────────────────────
 
 def archive_dataset(
@@ -562,6 +745,7 @@ def archive_dataset(
     checksum_algo="sha256", use_tar=False, lab="", pi="", notes="",
     progress_cb=None, dry_run=False,
     cfg=None, sg_device="", st_device="",
+    direct_write=False,
 ):
     def progress(msg):
         if progress_cb:
@@ -595,71 +779,109 @@ def archive_dataset(
             mount_tape(sg_device, mount_point, progress_cb)
 
     stage_path = os.path.join(staging_dir, archive_id)
-    Path(stage_path).mkdir(parents=True, exist_ok=True)
 
     try:
-        if use_tar:
-            tar_name = "{}.tar".format(archive_id)
-            tar_path = os.path.join(stage_path, tar_name)
-            progress("Creating tar bundle: {}".format(tar_path))
-            with tarfile.open(tar_path, "w") as tf:
-                tf.add(source_path, arcname=os.path.basename(source_path))
-            staged_path = tar_path
-            size_bytes = os.path.getsize(tar_path)
-            file_count = 1
+        if direct_write:
+            # ── Direct write — no staging, source goes straight to tape ───────
+            progress("Direct write mode — writing from source to tape...")
+            tape_dest = os.path.join(mount_point, archive_id)
+            Path(tape_dest).mkdir(parents=True, exist_ok=True)
+
+            if use_tar:
+                tar_name = "{}.tar".format(archive_id)
+                tape_file = os.path.join(tape_dest, tar_name)
+                progress("Creating tar bundle directly on tape: {}".format(tape_file))
+                with tarfile.open(tape_file, "w") as tf:
+                    tf.add(source_path, arcname=os.path.basename(source_path))
+                size_bytes = os.path.getsize(tape_file)
+                file_count = 1
+                progress("Computing checksum...")
+                checksum_src   = checksum_file(tape_file, checksum_algo)
+                checksum_tape  = checksum_src
+            else:
+                size_bytes, file_count = dir_size_and_count(source_path)
+                progress("Copying directly to tape: {}".format(tape_dest))
+                result = subprocess.run(
+                    ["rsync", "-a", "--info=progress2",
+                     source_path + "/", tape_dest + "/"],
+                    stdout=None, stderr=None, universal_newlines=True
+                )
+                if result.returncode != 0:
+                    raise ArchiveError("rsync to tape failed (exit {})".format(
+                        result.returncode))
+                progress("Computing tape checksum...")
+                checksum_src  = checksum_tree(tape_dest, checksum_algo)
+                checksum_tape = checksum_src
+
+            progress("Checksum: {}".format(checksum_src))
+            progress("✔ Direct write complete.")
+
         else:
-            dest = os.path.join(stage_path, os.path.basename(source_path))
-            progress("Staging data to {}...".format(stage_path))
-            result = subprocess.run(
-                ["rsync", "-a", "--info=progress2",
-                 source_path + "/", dest + "/"],
-                stdout=None, stderr=None, universal_newlines=True
-            )
-            if result.returncode != 0:
-                raise ArchiveError("rsync staging failed (exit {})".format(
-                    result.returncode))
-            staged_path = dest
-            size_bytes, file_count = dir_size_and_count(staged_path)
+            # ── Staged write — copy to staging first, then to tape ────────────
+            Path(stage_path).mkdir(parents=True, exist_ok=True)
 
-        progress("Computing source checksum...")
-        if use_tar:
-            checksum_src = checksum_file(staged_path, checksum_algo)
-        else:
-            checksum_src = checksum_tree(staged_path, checksum_algo)
-        progress("Source checksum: {}".format(checksum_src))
+            if use_tar:
+                tar_name = "{}.tar".format(archive_id)
+                tar_path = os.path.join(stage_path, tar_name)
+                progress("Creating tar bundle: {}".format(tar_path))
+                with tarfile.open(tar_path, "w") as tf:
+                    tf.add(source_path, arcname=os.path.basename(source_path))
+                staged_path = tar_path
+                size_bytes = os.path.getsize(tar_path)
+                file_count = 1
+            else:
+                dest = os.path.join(stage_path, os.path.basename(source_path))
+                progress("Staging data to {}...".format(stage_path))
+                result = subprocess.run(
+                    ["rsync", "-a", "--info=progress2",
+                     source_path + "/", dest + "/"],
+                    stdout=None, stderr=None, universal_newlines=True
+                )
+                if result.returncode != 0:
+                    raise ArchiveError("rsync staging failed (exit {})".format(
+                        result.returncode))
+                staged_path = dest
+                size_bytes, file_count = dir_size_and_count(staged_path)
 
-        tape_dest = os.path.join(mount_point, archive_id)
-        Path(tape_dest).mkdir(parents=True, exist_ok=True)
-        progress("Copying to tape: {}".format(tape_dest))
+            progress("Computing source checksum...")
+            if use_tar:
+                checksum_src = checksum_file(staged_path, checksum_algo)
+            else:
+                checksum_src = checksum_tree(staged_path, checksum_algo)
+            progress("Source checksum: {}".format(checksum_src))
 
-        if use_tar:
-            shutil.copy2(staged_path, os.path.join(tape_dest, tar_name))
-            tape_file = os.path.join(tape_dest, tar_name)
-        else:
-            result = subprocess.run(
-                ["rsync", "-a", "--info=progress2",
-                 staged_path + "/", tape_dest + "/"],
-                stdout=None, stderr=None, universal_newlines=True
-            )
-            if result.returncode != 0:
-                raise ArchiveError("rsync to tape failed (exit {})".format(
-                    result.returncode))
+            tape_dest = os.path.join(mount_point, archive_id)
+            Path(tape_dest).mkdir(parents=True, exist_ok=True)
+            progress("Copying to tape: {}".format(tape_dest))
 
-        progress("Verifying tape copy...")
-        if use_tar:
-            checksum_tape = checksum_file(tape_file, checksum_algo)
-        else:
-            checksum_tape = checksum_tree(tape_dest, checksum_algo)
-        progress("Tape checksum:   {}".format(checksum_tape))
+            if use_tar:
+                shutil.copy2(staged_path, os.path.join(tape_dest, tar_name))
+                tape_file = os.path.join(tape_dest, tar_name)
+            else:
+                result = subprocess.run(
+                    ["rsync", "-a", "--info=progress2",
+                     staged_path + "/", tape_dest + "/"],
+                    stdout=None, stderr=None, universal_newlines=True
+                )
+                if result.returncode != 0:
+                    raise ArchiveError("rsync to tape failed (exit {})".format(
+                        result.returncode))
 
-        if checksum_src != checksum_tape:
-            raise ArchiveError(
-                "CHECKSUM MISMATCH!\n"
-                "Source: {}\nTape:   {}\n"
-                "Archive aborted — data on tape may be corrupt.".format(
-                    checksum_src, checksum_tape))
+            progress("Verifying tape copy...")
+            if use_tar:
+                checksum_tape = checksum_file(tape_file, checksum_algo)
+            else:
+                checksum_tape = checksum_tree(tape_dest, checksum_algo)
+            progress("Tape checksum:   {}".format(checksum_tape))
 
-        progress("✔ Checksums match — archive verified.")
+            if checksum_src != checksum_tape:
+                raise ArchiveError(
+                    "CHECKSUM MISMATCH!\n"
+                    "Source: {}\nTape:   {}\n"
+                    "Archive aborted — data on tape may be corrupt.".format(
+                        checksum_src, checksum_tape))
+
+            progress("✔ Checksums match — archive verified.")
 
         record = ArchiveRecord(
             archive_id=archive_id, name=name, tape_label=tape_label,
@@ -675,7 +897,7 @@ def archive_dataset(
         return record
 
     finally:
-        if os.path.exists(stage_path):
+        if not direct_write and os.path.exists(stage_path):
             progress("Cleaning up staging area...")
             shutil.rmtree(stage_path, ignore_errors=True)
 
@@ -1148,6 +1370,7 @@ def submit_archive_job(
     staging_dir, mount_point, checksum_algo="sha256",
     use_tar=False, lab="", pi="", notes="",
     cfg=None, sg_device="", st_device="",
+    direct_write=False,
 ):
     """
     Submit an archive job to run in the background.
@@ -1173,6 +1396,7 @@ def submit_archive_job(
         "pi":           pi,
         "notes":        notes,
         "use_tar":      use_tar,
+        "direct_write": direct_write,
     }
     _write_job(state_dir, job)
 
@@ -1221,6 +1445,7 @@ def submit_archive_job(
                 cfg=cfg,
                 sg_device=sg_device,
                 st_device=st_device,
+                direct_write=direct_write,
             )
             # Success
             j = _read_job(_job_file(state_dir, job_id)) or job.copy()

@@ -495,11 +495,16 @@ def do_archive():
     use_tar    = confirm(
         "Bundle as tar archive? (recommended for many small files)", default=TAR_DEF
     )
+    direct     = confirm(
+        "Direct write to tape? (skip staging — use if source is on fast local disk)",
+        default=False
+    )
 
     print()
 
     # Preflight
-    errors = core.preflight_check(source_path, STAGING, MOUNT, MIN_STG)
+    errors = core.preflight_check(source_path, STAGING, MOUNT, MIN_STG,
+                                  direct_write=direct)
     if errors:
         if RICH:
             console.print("  [red bold]Preflight checks failed:[/red bold]")
@@ -534,6 +539,7 @@ def do_archive():
         checksum_algo=ALGO, use_tar=use_tar,
         lab=lab, pi=pi, notes=notes,
         cfg=cfg, sg_device=SG, st_device=ST,
+        direct_write=direct,
     )
     print()
     if RICH:
@@ -789,6 +795,7 @@ def do_inventory():
             ("6", "Which tape has archive ID?"),
             ("7", "Export to CSV"),
             ("8", "Maintenance log"),
+            ("9", "Import existing tape into database"),
             ("b", "Back"),
         ])
 
@@ -882,10 +889,143 @@ def do_inventory():
                         ))
             pause()
 
+        elif choice == "9":
+            do_import_tape()
+            continue
+
         elif choice == "b":
             break
 
-# ── Library / Changer ─────────────────────────────────────────────────────────
+# ── Import Existing Tape ──────────────────────────────────────────────────────
+
+def do_import_tape():
+    header("Import Existing Tape")
+
+    if not core.is_mounted(MOUNT):
+        error("No tape mounted. Mount the tape first (Tape Management → Mount).")
+        pause()
+        return
+
+    if RICH:
+        console.print(
+            "  This will scan the mounted tape and register its contents\n"
+            "  in the tapeman2 database.\n\n"
+            "  Each top-level directory/file on the tape becomes one archive entry.\n"
+        )
+    else:
+        print("  Scan mounted tape and register contents in database.\n")
+
+    tape_label = prompt("Tape label (what is this tape called?)").upper().strip()
+    if not tape_label:
+        error("Tape label required.")
+        pause()
+        return
+
+    lab = prompt("Lab name (optional)", default="")
+    pi  = prompt("PI name (optional)", default="")
+
+    info("Scanning tape contents...")
+    contents = core.scan_tape_contents(MOUNT)
+
+    if not contents:
+        warn("No entries found on tape.")
+        pause()
+        return
+
+    print()
+    if RICH:
+        from rich.table import Table
+        from rich import box as rbox
+        t = Table(box=rbox.SIMPLE_HEAVY, title="Tape Contents")
+        t.add_column("#",     style="dim",   width=4)
+        t.add_column("Name",  style="cyan",  max_width=40)
+        t.add_column("Size",  style="green", justify="right")
+        t.add_column("Files", justify="right")
+        t.add_column("Type",  style="dim")
+        for i, e in enumerate(contents):
+            t.add_row(str(i+1), e["name"],
+                      core.human_size(e["size_bytes"]),
+                      str(e["file_count"]),
+                      "directory" if e["is_dir"] else "file")
+        console.print(t)
+    else:
+        fmt = "{:<4} {:<40} {:<10} {:<8} {}"
+        print(fmt.format("#", "Name", "Size", "Files", "Type"))
+        print("-" * 70)
+        for i, e in enumerate(contents):
+            print(fmt.format(i+1, e["name"][:39],
+                             core.human_size(e["size_bytes"]),
+                             e["file_count"],
+                             "dir" if e["is_dir"] else "file"))
+    print()
+
+    compute_cs = confirm(
+        "Compute checksums? (reads full tape — slow but gives verified status)",
+        default=True
+    )
+
+    if RICH:
+        console.print(
+            "\n  [dim]Press Enter to use the directory name, "
+            "or type a custom dataset name.[/dim]\n")
+    else:
+        print("\n  Press Enter to use directory name, or type a custom name.\n")
+
+    entry_metadata = {}
+    for e in contents:
+        custom_name = prompt(
+            "Name for '{}' ({})".format(
+                e["name"], core.human_size(e["size_bytes"])),
+            default=e["name"]
+        )
+        entry_metadata[e["name"]] = {
+            "name":  custom_name,
+            "lab":   lab,
+            "pi":    pi,
+            "notes": "Imported from existing tape {}".format(tape_label),
+        }
+
+    print()
+    if not confirm("Import {} entries from tape '{}'?".format(
+            len(contents), tape_label), default=True):
+        warn("Import cancelled.")
+        pause()
+        return
+
+    print()
+    try:
+        records = core.import_full_tape(
+            tape_label=tape_label,
+            db_path=DB,
+            mount_point=MOUNT,
+            lab=lab,
+            pi=pi,
+            checksum_algo=ALGO,
+            compute_checksum=compute_cs,
+            progress_cb=progress_msg,
+            entry_metadata=entry_metadata,
+        )
+        print()
+        if RICH:
+            from rich.panel import Panel
+            console.print(Panel(
+                "[green bold]Import complete![/green bold]\n\n"
+                "  {} entries registered from tape '{}'.\n"
+                "  Status: {}\n\n"
+                "[dim]View in Inventory → List all archives.[/dim]".format(
+                    len(records), tape_label,
+                    "verified" if compute_cs else "archived"),
+                title="Import Complete", border_style="green"
+            ))
+        else:
+            print("  Import complete — {} entries registered.".format(len(records)))
+            for r in records:
+                print("  {} — {}  ({})".format(
+                    r.archive_id, r.name, core.human_size(r.size_bytes)))
+    except Exception as e:
+        error("Import failed: {}".format(e))
+    pause()
+
 
 def do_library():
     if not core.changer_enabled(cfg):

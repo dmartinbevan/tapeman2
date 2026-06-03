@@ -150,6 +150,7 @@ class TapeMan2App(tk.Tk):
         self.tab_inventory= InventoryTab(self.nb, self)
         self.tab_tapes    = TapeTab(self.nb, self)
         self.tab_library  = LibraryTab(self.nb, self)
+        self.tab_import   = ImportTab(self.nb, self)
         self.tab_log      = LogTab(self.nb, self)
 
         self.nb.add(self.tab_archive,   text="  Archive  ")
@@ -159,6 +160,7 @@ class TapeMan2App(tk.Tk):
         self.nb.add(self.tab_inventory, text="  Inventory")
         self.nb.add(self.tab_tapes,     text="  Tapes    ")
         self.nb.add(self.tab_library,   text="  Library  ")
+        self.nb.add(self.tab_import,    text="  Import   ")
         self.nb.add(self.tab_log,       text="  Log      ")
 
         # ── Bottom log strip ──────────────────────────────────────────────────
@@ -298,6 +300,14 @@ class ArchiveTab(ttk.Frame, LogMixin):
                         variable=self.var_tar).grid(row=row, column=0, columnspan=3,
                                                      sticky="w", pady=4)
 
+        # Direct write checkbox
+        row += 1
+        self.var_direct = tk.BooleanVar(value=False)
+        ttk.Checkbutton(left,
+                        text="Direct write to tape (skip staging — use if source is on fast local disk)",
+                        variable=self.var_direct).grid(row=row, column=0, columnspan=3,
+                                                        sticky="w", pady=4)
+
         # Dry run checkbox
         row += 1
         self.var_dry = tk.BooleanVar(value=False)
@@ -349,6 +359,7 @@ class ArchiveTab(ttk.Frame, LogMixin):
             pi     = self.vars["pi"].get().strip()
             notes  = self.vars["notes"].get().strip()
             use_tar= self.var_tar.get()
+            direct = self.var_direct.get()
             dry    = self.var_dry.get()
 
             if not src or not name or not tape:
@@ -378,6 +389,7 @@ class ArchiveTab(ttk.Frame, LogMixin):
                 checksum_algo=ALGO, use_tar=use_tar,
                 lab=lab, pi=pi, notes=notes,
                 cfg=cfg, sg_device=SG, st_device=ST,
+                direct_write=direct,
             )
             self.log("✔ Archive job submitted: {}".format(job["job_id"]))
             self.log("  Running in background — check the Jobs tab for progress.")
@@ -1300,6 +1312,170 @@ class LibraryTab(ttk.Frame, LogMixin):
             self.app._refresh_status()
         except Exception as e:
             self.log("Error: {}".format(e))
+        finally:
+            self.progress.stop()
+
+# ── Import Tab ────────────────────────────────────────────────────────────────
+
+class ImportTab(ttk.Frame, LogMixin):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._contents = []
+        self._entry_vars = {}
+        self._build()
+
+    def _build(self):
+        top = ttk.Frame(self, padding=(16, 8))
+        top.pack(fill="x")
+        ttk.Label(top, text="Import Existing Tape", font=FONT_H2,
+                  foreground=CYAN, background=BG).pack(side="left")
+
+        # Left: controls
+        left = ttk.Frame(self, padding=(16, 4))
+        left.pack(side="left", fill="y")
+
+        ttk.Label(left, text="Tape label:").grid(row=0, column=0, sticky="e", padx=(0,8), pady=4)
+        self.var_label = tk.StringVar()
+        ttk.Entry(left, textvariable=self.var_label, width=18,
+                  font=FONT_SM).grid(row=0, column=1, sticky="ew", pady=4)
+
+        ttk.Label(left, text="Lab:").grid(row=1, column=0, sticky="e", padx=(0,8), pady=4)
+        self.var_lab = tk.StringVar()
+        ttk.Entry(left, textvariable=self.var_lab, width=18,
+                  font=FONT_SM).grid(row=1, column=1, sticky="ew", pady=4)
+
+        ttk.Label(left, text="PI:").grid(row=2, column=0, sticky="e", padx=(0,8), pady=4)
+        self.var_pi = tk.StringVar()
+        ttk.Entry(left, textvariable=self.var_pi, width=18,
+                  font=FONT_SM).grid(row=2, column=1, sticky="ew", pady=4)
+
+        self.var_checksum = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left, text="Compute checksums\n(slow — reads full tape)",
+                        variable=self.var_checksum).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=8)
+
+        ttk.Button(left, text="1. Scan Tape Contents",
+                   command=self._scan).grid(row=4, column=0, columnspan=2,
+                                             sticky="ew", pady=4)
+
+        ttk.Separator(left, orient="horizontal").grid(row=5, column=0,
+                      columnspan=2, sticky="ew", pady=8)
+
+        ttk.Label(left, text="Dataset names:", style="Dim.TLabel").grid(
+            row=6, column=0, columnspan=2, sticky="w")
+
+        self.names_frame = ttk.Frame(left)
+        self.names_frame.grid(row=7, column=0, columnspan=2, sticky="ew")
+
+        self.progress = ttk.Progressbar(left, mode="indeterminate", length=220,
+                                         style="Horizontal.TProgressbar")
+        self.progress.grid(row=8, column=0, columnspan=2, sticky="ew", pady=8)
+
+        ttk.Button(left, text="2. Import into Database",
+                   style="Accent.TButton",
+                   command=self._import).grid(row=9, column=0, columnspan=2,
+                                               sticky="ew", pady=4)
+
+        # Right: log
+        right = ttk.Frame(self, padding=(16, 4))
+        right.pack(side="right", fill="both", expand=True)
+        ttk.Label(right,
+                  text="Mount a tape first (Tape Management tab), then scan it here.\n\n"
+                       "Each top-level directory/file becomes one archive entry.\n"
+                       "You can rename entries before importing.",
+                  background=BG, foreground=FG_DIM, font=FONT_SM,
+                  justify="left").pack(anchor="w", pady=(0, 8))
+        self._make_log(right, height=20).pack(fill="both", expand=True)
+
+    def _scan(self):
+        if not core.is_mounted(MOUNT):
+            messagebox.showerror("Not Mounted",
+                "No tape mounted.\nMount a tape in the Tape Management tab first.")
+            return
+        self.log_clear()
+        self.log("Scanning tape at {}...".format(MOUNT))
+        try:
+            self._contents = core.scan_tape_contents(MOUNT)
+        except Exception as e:
+            self.log("Error: {}".format(e))
+            return
+
+        if not self._contents:
+            self.log("No entries found on tape.")
+            return
+
+        self.log("Found {} entries:\n".format(len(self._contents)))
+        for e in self._contents:
+            self.log("  {}  {}  ({} files)".format(
+                e["name"], core.human_size(e["size_bytes"]), e["file_count"]))
+
+        # Build name entry widgets
+        for w in self.names_frame.winfo_children():
+            w.destroy()
+        self._entry_vars = {}
+
+        for i, e in enumerate(self._contents):
+            ttk.Label(self.names_frame,
+                      text="{}:".format(e["name"][:20]),
+                      style="Dim.TLabel").grid(row=i, column=0, sticky="e", padx=(0,4))
+            var = tk.StringVar(value=e["name"])
+            self._entry_vars[e["name"]] = var
+            ttk.Entry(self.names_frame, textvariable=var, width=22,
+                      font=FONT_SM).grid(row=i, column=1, sticky="ew", pady=2)
+
+        self.log("\nEdit dataset names above if needed, then click Import.")
+
+    @run_in_thread
+    def _import(self):
+        if not self._contents:
+            messagebox.showinfo("Scan First", "Scan the tape first (Step 1).")
+            return
+
+        label = self.var_label.get().strip().upper()
+        if not label:
+            messagebox.showerror("Error", "Tape label required.")
+            return
+
+        lab        = self.var_lab.get().strip()
+        pi         = self.var_pi.get().strip()
+        compute_cs = self.var_checksum.get()
+
+        entry_metadata = {}
+        for e in self._contents:
+            var = self._entry_vars.get(e["name"])
+            name = var.get().strip() if var else e["name"]
+            entry_metadata[e["name"]] = {
+                "name":  name or e["name"],
+                "lab":   lab,
+                "pi":    pi,
+                "notes": "Imported from existing tape {}".format(label),
+            }
+
+        self.progress.start()
+        try:
+            records = core.import_full_tape(
+                tape_label=label,
+                db_path=DB,
+                mount_point=MOUNT,
+                lab=lab,
+                pi=pi,
+                checksum_algo=ALGO,
+                compute_checksum=compute_cs,
+                progress_cb=self.log,
+                entry_metadata=entry_metadata,
+            )
+            self.log("\n✔ Import complete — {} entries registered.".format(len(records)))
+            self.app.refresh_all()
+            messagebox.showinfo("Import Complete",
+                "{} entries imported from tape '{}'.\n"
+                "Status: {}\n\n"
+                "View in the Inventory tab.".format(
+                    len(records), label,
+                    "verified" if compute_cs else "archived"))
+        except Exception as e:
+            self.log("\n✘ Import failed: {}".format(e))
+            messagebox.showerror("Import Failed", str(e))
         finally:
             self.progress.stop()
 

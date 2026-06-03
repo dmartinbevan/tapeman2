@@ -1308,6 +1308,93 @@ def _check_permissions():
     sys.exit(1)
 
 
+def _wait_with_countdown(timeout=60):
+    """
+    Wait for input with a countdown. Only redraws the screen if the user
+    hasn't started typing yet. Once a key is pressed, stops refreshing
+    and waits for Enter normally.
+    Returns (input_string, remaining_seconds) or (None, 0) on timeout.
+    """
+    import select
+    import sys
+    import time
+    import tty
+    import termios
+
+    deadline  = time.time() + timeout
+    typed     = []
+    last_draw = time.time()
+
+    # Put terminal in raw mode so we can detect individual keypresses
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)  # cbreak: send chars immediately, keep Ctrl+C etc
+    except Exception:
+        # If terminal manipulation fails (e.g. not a tty), fall back to
+        # simple blocking input
+        sys.stdout.write("  Enter choice: ")
+        sys.stdout.flush()
+        line = sys.stdin.readline().strip().lower()
+        return line if line else None
+
+    try:
+        while True:
+            remaining = max(0, int(deadline - time.time()))
+
+            if remaining <= 0:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return None
+
+            # If user hasn't started typing, update the countdown line
+            # by redrawing the whole screen every 5s (or last 10s every 1s)
+            if not typed:
+                now = time.time()
+                redraw_interval = 1 if remaining <= 10 else 5
+                if now - last_draw >= redraw_interval:
+                    _draw_main_menu(remaining)
+                    last_draw = now
+
+            # Poll for a keypress — 0.25s granularity
+            ready, _, _ = select.select([sys.stdin], [], [], 0.25)
+            if not ready:
+                continue
+
+            ch = sys.stdin.read(1)
+
+            if ch in ('\n', '\r'):
+                # Enter pressed — submit
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                result = "".join(typed).strip().lower()
+                return result if result else None
+
+            elif ch in ('\x7f', '\x08'):
+                # Backspace
+                if typed:
+                    typed.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+
+            elif ch == '\x03':
+                # Ctrl+C
+                raise KeyboardInterrupt
+
+            elif ch.isprintable():
+                # Regular character — show it and add to buffer
+                if not typed:
+                    # First keypress — print the prompt if not already shown
+                    # (after a redraw the prompt is already there)
+                    pass
+                typed.append(ch)
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
 def _draw_main_menu(remaining):
     """Draw the full main menu screen including countdown in status area."""
     header()
@@ -1342,7 +1429,6 @@ def _draw_main_menu(remaining):
 
 
 def main():
-    import select
     import time
 
     _check_permissions()
@@ -1350,34 +1436,10 @@ def main():
     REFRESH_INTERVAL = 60
 
     while True:
-        remaining = REFRESH_INTERVAL
-        deadline  = time.time() + REFRESH_INTERVAL
-
-        # Draw initial screen with full countdown
-        _draw_main_menu(remaining)
-
-        choice = None
-        while choice is None:
-            remaining = max(0, int(deadline - time.time()))
-
-            # Poll for input — 1 second at a time
-            ready, _, _ = select.select([sys.stdin], [], [], 1.0)
-
-            if ready:
-                choice = sys.stdin.readline().strip().lower()
-                break
-
-            # Check if countdown expired — full redraw
-            if remaining <= 0:
-                break
-
-            # Redraw just the countdown line in the status area
-            # by redrawing the whole screen (clean, no cursor tricks)
-            if remaining % 5 == 0 or remaining <= 10:
-                _draw_main_menu(remaining)
+        _draw_main_menu(REFRESH_INTERVAL)
+        choice = _wait_with_countdown(REFRESH_INTERVAL)
 
         if choice is None:
-            # Timed out — full redraw next iteration
             continue
 
         if choice == "1":

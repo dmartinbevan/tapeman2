@@ -90,13 +90,32 @@ def status_line():
             console.print("  Tape: [green]● Mounted at {}[/green]  "
                           "[dim]({})[/dim]".format(MOUNT, free_str))
         else:
-            console.print("  Tape: [yellow]○ Not mounted[/yellow]")
+            # Check drive state for helpful message
+            state, msg = core.tape_drive_state(ST, SG)
+            plat = core._get_platform()
+            if state == plat.TAPE_STATE_INITIALIZING:
+                console.print("  Tape: [yellow]⏳ Initializing — {}[/yellow]".format(msg))
+            elif state == plat.TAPE_STATE_NO_TAPE:
+                console.print("  Tape: [dim]○ No tape loaded[/dim]")
+            elif state == plat.TAPE_STATE_NOT_READY:
+                console.print("  Tape: [yellow]○ Not ready — loading...[/yellow]")
+            else:
+                console.print("  Tape: [yellow]○ Not mounted[/yellow]")
     else:
         if mounted:
             free_str = _tape_free_nonblocking()
             print("  Tape: MOUNTED at {} ({})".format(MOUNT, free_str))
         else:
-            print("  Tape: not mounted")
+            state, msg = core.tape_drive_state(ST, SG)
+            plat = core._get_platform()
+            if state == plat.TAPE_STATE_INITIALIZING:
+                print("  Tape: INITIALIZING — {}".format(msg))
+            elif state == plat.TAPE_STATE_NO_TAPE:
+                print("  Tape: no tape loaded")
+            elif state == plat.TAPE_STATE_NOT_READY:
+                print("  Tape: not ready — loading...")
+            else:
+                print("  Tape: not mounted")
 
     # Active jobs
     active = core.active_job_count(STATE_DIR)
@@ -324,7 +343,7 @@ def _mount_tape():
     if not confirm("Proceed with mount?"):
         return
     try:
-        core.mount_tape(SG, MOUNT, progress_cb=progress_msg)
+        core.mount_tape(SG, MOUNT, progress_cb=progress_msg, st_device=ST)
         info(f"Tape mounted at {MOUNT}")
     except core.TapeError as e:
         error(str(e))
@@ -424,7 +443,7 @@ def _format_tape():
         core.add_tape(DB, label)
         info(f"Tape '{label}' registered in database.")
         if confirm("Mount the tape now?"):
-            core.mount_tape(SG, MOUNT, progress_cb=progress_msg)
+            core.mount_tape(SG, MOUNT, progress_cb=progress_msg, st_device=ST)
             info(f"Tape mounted at {MOUNT}")
     except core.TapeError as e:
         error(str(e))
@@ -608,7 +627,7 @@ def do_restore():
     if not core.is_mounted(MOUNT):
         if confirm("Tape not mounted. Mount it now?"):
             try:
-                core.mount_tape(SG, MOUNT, progress_cb=progress_msg)
+                core.mount_tape(SG, MOUNT, progress_cb=progress_msg, st_device=ST)
             except core.TapeError as e:
                 error(str(e))
                 pause()

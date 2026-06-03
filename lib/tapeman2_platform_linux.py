@@ -88,6 +88,123 @@ def tape_status(st_device):
     result = run_cmd(["mt", "-f", st_device, "status"], timeout=10)
     return result.stdout
 
+# ── Drive / Tape State Detection ─────────────────────────────────────────────
+
+TAPE_STATE_READY        = "ready"
+TAPE_STATE_INITIALIZING = "initializing"
+TAPE_STATE_NO_TAPE      = "no_tape"
+TAPE_STATE_NOT_READY    = "not_ready"
+TAPE_STATE_UNKNOWN      = "unknown"
+
+def tape_drive_state(st_device, sg_device=None):
+    """
+    Returns (state, message).
+    States: ready | initializing | no_tape | not_ready | unknown
+    """
+    import re
+    result = run_cmd(["mt", "-f", st_device, "status"], timeout=10)
+    if result.returncode == 0:
+        out = result.stdout.upper()
+        raw = result.stdout.lower()
+
+        if "DR_OPEN" in out and "ONLINE" not in out:
+            return TAPE_STATE_NO_TAPE, "No tape loaded in drive"
+
+        if "ONLINE" in out:
+            m = re.search(r"block number=(-?\d+)", raw)
+            if m and int(m.group(1)) >= 0:
+                return TAPE_STATE_READY, "Tape ready"
+            return TAPE_STATE_NOT_READY, "Tape loading..."
+
+        if "NOT READY" in out or "ILI" in out:
+            return TAPE_STATE_NOT_READY, "Drive not ready"
+
+    # sg_turs — Test Unit Ready
+    if sg_device:
+        result = run_cmd(["sg_turs", sg_device], timeout=10)
+        if result.returncode != 0:
+            err = (result.stdout + result.stderr).lower()
+            if "initializ" in err or "04/03" in err:
+                return TAPE_STATE_INITIALIZING, \
+                    "Tape initializing — new LTO-9 cartridges require 15-30 min"
+            if "no medium" in err or "no tape" in err:
+                return TAPE_STATE_NO_TAPE, "No tape loaded"
+            return TAPE_STATE_NOT_READY, "Drive not ready"
+        return TAPE_STATE_READY, "Tape ready"
+
+    return TAPE_STATE_UNKNOWN, "Could not determine drive state"
+
+def wait_for_tape_ready(st_device, sg_device=None,
+                         timeout_minutes=40, progress_cb=None):
+    """
+    Poll until tape is ready or timeout. Returns (bool, message).
+    """
+    import time
+    interval  = 10
+    max_polls = (timeout_minutes * 60) // interval
+
+    for poll in range(max_polls):
+        state, msg = tape_drive_state(st_device, sg_device)
+
+        if state == TAPE_STATE_READY:
+            return True, "Tape ready."
+        if state == TAPE_STATE_NO_TAPE:
+            return False, "No tape loaded — please insert a cartridge."
+
+        elapsed = poll * interval
+        mins = elapsed // 60
+        secs = elapsed % 60
+        timer = "{}m {}s".format(mins, secs) if mins else "{}s".format(secs)
+
+        if state == TAPE_STATE_INITIALIZING:
+            status_msg = ("⏳ Tape initializing ({} elapsed) — "
+                          "new LTO-9 cartridges require 15-30 min. "
+                          "Please wait...".format(timer))
+        else:
+            status_msg = "⏳ Drive not ready ({} elapsed) — waiting...".format(timer)
+
+        if progress_cb:
+            progress_cb(status_msg)
+
+        time.sleep(interval)
+
+    return False, "Timed out after {} minutes waiting for tape.".format(
+        timeout_minutes)
+
+def mount_tape(sg_device, mount_point, progress_cb=None, st_device=None):
+    """
+    Mount LTFS tape. Automatically waits for tape initialization if needed.
+    Pass st_device to enable drive state detection.
+    """
+    from pathlib import Path
+    Path(mount_point).mkdir(parents=True, exist_ok=True)
+    if is_mounted(mount_point):
+        return
+    load_fuse()
+
+    # Check drive state and wait if initializing
+    if st_device:
+        state, msg = tape_drive_state(st_device, sg_device)
+        if state == TAPE_STATE_NO_TAPE:
+            raise RuntimeError("No tape loaded. Please insert a cartridge.")
+        if state in (TAPE_STATE_INITIALIZING, TAPE_STATE_NOT_READY):
+            if progress_cb:
+                progress_cb(msg)
+            ready, wait_msg = wait_for_tape_ready(
+                st_device, sg_device, progress_cb=progress_cb)
+            if not ready:
+                raise RuntimeError(wait_msg)
+
+    if progress_cb:
+        progress_cb("Mounting tape...")
+    result = run_cmd(
+        ["ltfs", "-o", "devname={}".format(sg_device), mount_point],
+        timeout=120
+    )
+    if not is_mounted(mount_point):
+        raise RuntimeError("Failed to mount tape:\n{}\n{}".format(
+            result.stderr, result.stdout))
+
 # ── Cleaning Detection ────────────────────────────────────────────────────────
 
 # TapeAlert log page (0x2e) flag meanings we care about

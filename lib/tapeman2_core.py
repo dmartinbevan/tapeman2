@@ -296,8 +296,9 @@ def run_cmd(cmd, timeout=300):
 def is_mounted(mount_point):
     return _get_platform().is_mounted(mount_point)
 
-def mount_tape(sg_device, mount_point, progress_cb=None):
-    _get_platform().mount_tape(sg_device, mount_point, progress_cb)
+def mount_tape(sg_device, mount_point, progress_cb=None, st_device=None):
+    _get_platform().mount_tape(sg_device, mount_point, progress_cb,
+                               st_device=st_device)
 
 def unmount_tape(mount_point, progress_cb=None):
     _get_platform().unmount_tape(mount_point, progress_cb)
@@ -328,6 +329,13 @@ def tape_total_bytes(mount_point):
     if not is_mounted(mount_point):
         return 0
     return shutil.disk_usage(mount_point).total
+
+def tape_drive_state(st_device, sg_device=None):
+    """Return (state, message) for current drive/tape state."""
+    try:
+        return _get_platform().tape_drive_state(st_device, sg_device)
+    except Exception:
+        return _get_platform().TAPE_STATE_UNKNOWN, "unknown"
 
 # ── Cleaning Detection ────────────────────────────────────────────────────────
 

@@ -1,0 +1,365 @@
+#!/bin/bash
+# tape-manage — Interactive LTFS tape management script
+# For use with Quantum LTO-9 on Rocky Linux
+# Place at /usr/local/bin/tape-manage and chmod +x
+
+DEVICE="/dev/sg0"
+ST_DEVICE="/dev/nst0"
+MOUNT_POINT="/mnt/tape"
+LOG="/var/log/tape-manage.log"
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> "$LOG"
+}
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+print_header() {
+    clear
+    echo -e "${CYAN}${BOLD}"
+    echo "╔══════════════════════════════════════════╗"
+    echo "║         LTFS Tape Manager                ║"
+    echo "║         Quantum LTO-9  •  Rocky Linux    ║"
+    echo "╚══════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
+pause() {
+    echo ""
+    read -rp "Press [Enter] to continue..."
+}
+
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}ERROR: This script must be run as root.${NC}"
+        exit 1
+    fi
+}
+
+check_drive() {
+    if ! lsscsi | grep -q "tape"; then
+        echo -e "${RED}ERROR: No tape drive detected. Is it powered on and connected?${NC}"
+        log "ERROR: Tape drive not detected"
+        return 1
+    fi
+    return 0
+}
+
+is_mounted() {
+    mountpoint -q "$MOUNT_POINT" 2>/dev/null
+}
+
+wait_for_tape() {
+    echo -e "${YELLOW}Waiting for tape to become ready...${NC}"
+    local attempts=0
+    local max=30
+    while [[ $attempts -lt $max ]]; do
+        if mt -f "$ST_DEVICE" status 2>/dev/null | grep -q "ONLINE\|BOT"; then
+            echo -e "${GREEN}Tape is ready.${NC}"
+            return 0
+        fi
+        # Also check if tape is simply loaded (block number changes from -1)
+        local blk
+        blk=$(mt -f "$ST_DEVICE" status 2>/dev/null | grep "block number" | grep -v "\-1")
+        if [[ -n "$blk" ]]; then
+            echo -e "${GREEN}Tape is ready.${NC}"
+            return 0
+        fi
+        sleep 2
+        ((attempts++))
+        echo -n "."
+    done
+    echo ""
+    echo -e "${YELLOW}Tape may still be loading. Proceeding anyway...${NC}"
+    return 0
+}
+
+# ── Actions ───────────────────────────────────────────────────────────────────
+
+do_format_new_tape() {
+    print_header
+    echo -e "${BOLD}── Format a New (Blank) Tape ──${NC}"
+    echo ""
+    echo -e "${RED}WARNING: This will ERASE ALL DATA on the tape.${NC}"
+    echo "Only use this on a brand new or intentionally blank tape."
+    echo ""
+
+    if is_mounted; then
+        echo -e "${RED}ERROR: A tape is currently mounted at $MOUNT_POINT.${NC}"
+        echo "Please unmount it first (Option 4)."
+        pause
+        return
+    fi
+
+    read -rp "Enter a label for this tape (e.g. ARCH001): " label
+    if [[ -z "$label" ]]; then
+        echo -e "${RED}Label cannot be empty.${NC}"
+        pause
+        return
+    fi
+
+    # Uppercase and trim spaces
+    label=$(echo "$label" | tr '[:lower:]' '[:upper:]' | tr -d ' ')
+
+    echo ""
+    echo -e "Label will be: ${CYAN}${BOLD}$label${NC}"
+    read -rp "Are you sure you want to format the tape? Type YES to confirm: " confirm
+    if [[ "$confirm" != "YES" ]]; then
+        echo "Format cancelled."
+        pause
+        return
+    fi
+
+    echo ""
+    echo -e "${YELLOW}Formatting tape '$label' — this may take a few minutes...${NC}"
+    log "FORMAT START: label=$label device=$DEVICE"
+
+    if mkltfs -d "$DEVICE" -s "$label" 2>&1 | tee -a "$LOG" | grep -E "succeeded|failed|ERROR"; then
+        echo ""
+        if mkltfs -d "$DEVICE" -s "$label" 2>&1 | grep -q "succeeded"; then
+            echo -e "${GREEN}Format succeeded!${NC}"
+            log "FORMAT SUCCESS: label=$label"
+        fi
+    fi
+
+    # Run mkltfs and capture result properly
+    echo ""
+    echo -e "${YELLOW}Running format...${NC}"
+    mkltfs_output=$(mkltfs -d "$DEVICE" -s "$label" 2>&1)
+    echo "$mkltfs_output" >> "$LOG"
+
+    if echo "$mkltfs_output" | grep -q "succeeded"; then
+        echo -e "${GREEN}${BOLD}✔ Tape '$label' formatted successfully!${NC}"
+        log "FORMAT SUCCESS: label=$label"
+        echo ""
+        read -rp "Would you like to mount the tape now? [y/N]: " mount_now
+        if [[ "$mount_now" =~ ^[Yy]$ ]]; then
+            do_mount_tape_direct
+        fi
+    else
+        echo -e "${RED}Format may have failed. Check the log: $LOG${NC}"
+        echo ""
+        echo "Last output:"
+        echo "$mkltfs_output" | tail -10
+        log "FORMAT FAILED: label=$label"
+    fi
+    pause
+}
+
+do_mount_tape_direct() {
+    # Called internally after format or from menu
+    if is_mounted; then
+        echo -e "${YELLOW}A tape is already mounted at $MOUNT_POINT.${NC}"
+        return
+    fi
+
+    mkdir -p "$MOUNT_POINT"
+
+    echo -e "${YELLOW}Mounting tape at $MOUNT_POINT...${NC}"
+    log "MOUNT START: device=$DEVICE mountpoint=$MOUNT_POINT"
+
+    # Load fuse module if needed
+    modprobe fuse 2>/dev/null
+
+    mount_output=$(ltfs -o devname="$DEVICE" "$MOUNT_POINT" 2>&1)
+    echo "$mount_output" >> "$LOG"
+
+    if is_mounted; then
+        echo -e "${GREEN}${BOLD}✔ Tape mounted successfully at $MOUNT_POINT${NC}"
+        log "MOUNT SUCCESS"
+        echo ""
+        echo -e "You can now read/write files at: ${CYAN}${BOLD}$MOUNT_POINT${NC}"
+        echo -e "${YELLOW}Remember to unmount before ejecting the tape!${NC}"
+    else
+        echo -e "${RED}Mount failed. Last output:${NC}"
+        echo "$mount_output" | tail -10
+        log "MOUNT FAILED"
+    fi
+}
+
+do_mount_existing_tape() {
+    print_header
+    echo -e "${BOLD}── Mount an Existing (Already Formatted) Tape ──${NC}"
+    echo ""
+
+    if is_mounted; then
+        echo -e "${YELLOW}A tape is already mounted at $MOUNT_POINT.${NC}"
+        echo "Unmount it first if you want to load a different tape."
+        pause
+        return
+    fi
+
+    check_drive || { pause; return; }
+
+    echo "Make sure the tape is loaded in the drive."
+    wait_for_tape
+
+    do_mount_tape_direct
+    pause
+}
+
+do_unmount_tape() {
+    print_header
+    echo -e "${BOLD}── Unmount and Eject Tape ──${NC}"
+    echo ""
+
+    if ! is_mounted; then
+        echo -e "${YELLOW}No tape is currently mounted at $MOUNT_POINT.${NC}"
+
+        # Offer to just eject if tape is in drive
+        read -rp "Would you like to eject the tape anyway? [y/N]: " eject_anyway
+        if [[ "$eject_anyway" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Ejecting tape...${NC}"
+            mt -f "$ST_DEVICE" offline 2>&1
+            echo -e "${GREEN}✔ Tape ejected.${NC}"
+            log "EJECT (no mount): device=$ST_DEVICE"
+        fi
+        pause
+        return
+    fi
+
+    echo -e "${YELLOW}Unmounting $MOUNT_POINT — LTFS will write the index to tape first.${NC}"
+    echo "This may take a moment..."
+    echo ""
+
+    log "UNMOUNT START: mountpoint=$MOUNT_POINT"
+
+    fusermount -u "$MOUNT_POINT" 2>&1
+    sleep 2
+
+    if ! is_mounted; then
+        echo -e "${GREEN}${BOLD}✔ Tape unmounted successfully.${NC}"
+        log "UNMOUNT SUCCESS"
+        echo ""
+        read -rp "Eject the tape? [Y/n]: " do_eject
+        if [[ ! "$do_eject" =~ ^[Nn]$ ]]; then
+            echo -e "${YELLOW}Ejecting...${NC}"
+            mt -f "$ST_DEVICE" offline 2>&1
+            echo -e "${GREEN}✔ Tape ejected. Safe to remove.${NC}"
+            log "EJECT SUCCESS"
+        fi
+    else
+        echo -e "${RED}Unmount failed. There may be open files on the tape.${NC}"
+        echo "Close any open files or terminals accessing $MOUNT_POINT and try again."
+        log "UNMOUNT FAILED"
+    fi
+    pause
+}
+
+do_tape_status() {
+    print_header
+    echo -e "${BOLD}── Tape / Drive Status ──${NC}"
+    echo ""
+
+    echo -e "${CYAN}Drive detection:${NC}"
+    lsscsi | grep tape || echo "  No tape drive found"
+    echo ""
+
+    echo -e "${CYAN}Mount status:${NC}"
+    if is_mounted; then
+        echo -e "  ${GREEN}✔ Tape is mounted at $MOUNT_POINT${NC}"
+        echo ""
+        echo -e "${CYAN}Disk usage:${NC}"
+        df -h "$MOUNT_POINT" 2>/dev/null || echo "  Unable to get usage"
+        echo ""
+        echo -e "${CYAN}Files on tape (top level):${NC}"
+        ls -lh "$MOUNT_POINT" 2>/dev/null | head -20
+    else
+        echo -e "  ${YELLOW}No tape mounted at $MOUNT_POINT${NC}"
+    fi
+
+    echo ""
+    echo -e "${CYAN}Raw drive status (mt):${NC}"
+    mt -f "$ST_DEVICE" status 2>/dev/null || echo "  Unable to query drive (no tape loaded?)"
+
+    pause
+}
+
+do_check_tape() {
+    print_header
+    echo -e "${BOLD}── Check / Repair Tape Filesystem (ltfsck) ──${NC}"
+    echo ""
+
+    if is_mounted; then
+        echo -e "${RED}ERROR: Tape is currently mounted. Unmount it first (Option 4).${NC}"
+        pause
+        return
+    fi
+
+    echo "This will check the tape filesystem for errors."
+    echo "A read-only check is safe; repair mode will attempt to fix problems."
+    echo ""
+    read -rp "Run in repair mode? [y/N]: " repair_mode
+
+    echo ""
+    echo -e "${YELLOW}Running ltfsck...${NC}"
+    log "LTFSCK START: device=$DEVICE repair=$repair_mode"
+
+    if [[ "$repair_mode" =~ ^[Yy]$ ]]; then
+        ltfsck -r -d "$DEVICE" 2>&1 | tee -a "$LOG"
+    else
+        ltfsck -d "$DEVICE" 2>&1 | tee -a "$LOG"
+    fi
+
+    log "LTFSCK COMPLETE"
+    pause
+}
+
+do_view_log() {
+    print_header
+    echo -e "${BOLD}── Activity Log ──${NC}"
+    echo ""
+    if [[ -f "$LOG" ]]; then
+        tail -40 "$LOG"
+    else
+        echo "No log entries yet."
+    fi
+    pause
+}
+
+# ── Main Menu ─────────────────────────────────────────────────────────────────
+
+check_root
+
+while true; do
+    print_header
+
+    # Show quick status in menu
+    if is_mounted; then
+        echo -e "  Status: ${GREEN}● Tape mounted at $MOUNT_POINT${NC}"
+    else
+        echo -e "  Status: ${YELLOW}○ No tape mounted${NC}"
+    fi
+    echo ""
+
+    echo -e "${BOLD}  What would you like to do?${NC}"
+    echo ""
+    echo "  1)  Format a NEW tape (erases everything)"
+    echo "  2)  Mount an EXISTING tape (already formatted)"
+    echo "  3)  Unmount and eject tape"
+    echo "  4)  Show tape / drive status"
+    echo "  5)  Check tape filesystem (ltfsck)"
+    echo "  6)  View activity log"
+    echo "  q)  Quit"
+    echo ""
+    read -rp "  Enter choice: " choice
+
+    case "$choice" in
+        1) do_format_new_tape ;;
+        2) do_mount_existing_tape ;;
+        3) do_unmount_tape ;;
+        4) do_tape_status ;;
+        5) do_check_tape ;;
+        6) do_view_log ;;
+        q|Q) echo "Goodbye."; exit 0 ;;
+        *) echo -e "${RED}Invalid choice.${NC}"; sleep 1 ;;
+    esac
+done

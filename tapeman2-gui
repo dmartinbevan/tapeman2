@@ -1,0 +1,1383 @@
+#!/usr/bin/env python3
+"""
+tapeman2-gui — Tkinter GUI for tapeman2
+Run locally or via SSH -X forwarding.
+"""
+
+import os
+import sys
+import threading
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, scrolledtext
+from datetime import datetime
+
+sys.path.insert(0, "/usr/local/lib/tapeman2")
+import tapeman2_core as core
+
+# ── Config ────────────────────────────────────────────────────────────────────
+cfg       = core.initialize()
+DB        = cfg.get("paths", "db_path")
+MOUNT     = cfg.get("device", "mount_point")
+SG        = cfg.get("device", "sg_device")
+ST        = cfg.get("device", "st_device")
+STAGING   = cfg.get("paths", "staging_dir")
+RESTORE   = cfg.get("paths", "restore_dir")
+STATE_DIR = cfg.get("paths", "state_dir",
+                    fallback=core._get_platform().DEFAULT_STATE_DIR)
+ALGO      = cfg.get("archive", "checksum_algo", fallback="sha256")
+MIN_STG   = cfg.getint("archive", "min_staging_free_gb", fallback=50)
+TAR_DEF   = cfg.getboolean("archive", "tar_by_default", fallback=False)
+
+# ── Colors / Styles ───────────────────────────────────────────────────────────
+BG       = "#1e1e2e"
+BG2      = "#2a2a3e"
+BG3      = "#313149"
+FG       = "#cdd6f4"
+FG_DIM   = "#6c7086"
+CYAN     = "#89dceb"
+GREEN    = "#a6e3a1"
+YELLOW   = "#f9e2af"
+RED      = "#f38ba8"
+BLUE     = "#89b4fa"
+ACCENT   = "#cba6f7"
+
+FONT     = ("Helvetica", 11)
+FONT_SM  = ("Helvetica", 10)
+FONT_MONO= ("Courier", 10)
+FONT_H1  = ("Helvetica", 14, "bold")
+FONT_H2  = ("Helvetica", 12, "bold")
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+def run_in_thread(fn):
+    """Decorator to run a function in a background thread."""
+    def wrapper(*args, **kwargs):
+        t = threading.Thread(target=fn, args=args, kwargs=kwargs, daemon=True)
+        t.start()
+    return wrapper
+
+# ── Base Window ───────────────────────────────────────────────────────────────
+
+class TapeMan2App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("TapeMan 2 — Quantum LTO-9 Archive Manager")
+        self.geometry("1100x720")
+        self.minsize(900, 600)
+        self.configure(bg=BG)
+        self.resizable(True, True)
+        self.update_idletasks()  # force geometry calculation before building UI
+
+        self._apply_styles()
+        self._build_ui()
+        self.update()          # force full redraw
+        self._refresh_status()
+        self.after(10000, self._auto_refresh)  # refresh status every 10s
+
+    def _apply_styles(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+
+        style.configure(".", background=BG, foreground=FG, font=FONT,
+                         fieldbackground=BG2, bordercolor=BG3,
+                         selectbackground=BLUE, selectforeground=BG)
+        style.configure("TFrame", background=BG)
+        style.configure("TLabel", background=BG, foreground=FG, font=FONT)
+        style.configure("Dim.TLabel", background=BG, foreground=FG_DIM, font=FONT_SM)
+        style.configure("Header.TLabel", background=BG, foreground=CYAN, font=FONT_H1)
+        style.configure("Sub.TLabel", background=BG, foreground=FG_DIM, font=FONT_SM)
+        style.configure("Status.TLabel", background=BG2, foreground=FG, font=FONT_SM,
+                        padding=(8, 4))
+        style.configure("TButton", background=BG3, foreground=FG, font=FONT,
+                        borderwidth=0, padding=(10, 6), relief="flat")
+        style.map("TButton",
+                  background=[("active", BLUE), ("pressed", ACCENT)],
+                  foreground=[("active", BG)])
+        style.configure("Accent.TButton", background=ACCENT, foreground=BG, font=FONT)
+        style.map("Accent.TButton", background=[("active", BLUE)])
+        style.configure("Danger.TButton", background=RED, foreground=BG, font=FONT)
+        style.configure("TNotebook", background=BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background=BG2, foreground=FG_DIM,
+                        padding=(12, 6), font=FONT)
+        style.map("TNotebook.Tab",
+                  background=[("selected", BG3)],
+                  foreground=[("selected", CYAN)])
+        style.configure("Treeview", background=BG2, foreground=FG, font=FONT_SM,
+                        fieldbackground=BG2, rowheight=26, borderwidth=0)
+        style.configure("Treeview.Heading", background=BG3, foreground=CYAN,
+                        font=(FONT[0], FONT[1], "bold"), relief="flat")
+        style.map("Treeview", background=[("selected", BLUE)],
+                  foreground=[("selected", BG)])
+        style.configure("TEntry", fieldbackground=BG2, foreground=FG,
+                        insertcolor=FG, bordercolor=BG3)
+        style.configure("TCombobox", fieldbackground=BG2, foreground=FG)
+        style.configure("TCheckbutton", background=BG, foreground=FG)
+        style.configure("Horizontal.TProgressbar", background=GREEN,
+                        troughcolor=BG2, borderwidth=0)
+
+    def _build_ui(self):
+        # ── Header ────────────────────────────────────────────────────────────
+        hdr = ttk.Frame(self)
+        hdr.pack(fill="x", padx=16, pady=(12, 0))
+        ttk.Label(hdr, text="TapeMan 2", style="Header.TLabel").pack(side="left")
+        ttk.Label(hdr, text="  Quantum LTO-9 Archive Manager",
+                  style="Sub.TLabel").pack(side="left", pady=(4, 0))
+
+        # ── Status bar ────────────────────────────────────────────────────────
+        self.status_frame = ttk.Frame(self, style="TFrame")
+        self.status_frame.pack(fill="x", padx=16, pady=8)
+        self.lbl_tape_status = ttk.Label(self.status_frame, text="Tape: checking...",
+                                          style="Status.TLabel")
+        self.lbl_tape_status.pack(side="left", padx=(0, 8))
+        self.lbl_staging_status = ttk.Label(self.status_frame, text="Staging: ...",
+                                             style="Status.TLabel")
+        self.lbl_staging_status.pack(side="left")
+        self.lbl_cleaning = ttk.Label(self.status_frame, text="",
+                                       foreground=RED, background=BG,
+                                       font=(FONT[0], FONT[1], "bold"))
+        # lbl_cleaning is shown/hidden dynamically by _update_cleaning_status
+        ttk.Button(self.status_frame, text="⟳ Refresh",
+                   command=self._refresh_status).pack(side="right")
+
+        # ── Notebook ──────────────────────────────────────────────────────────
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=16, pady=(0, 4))
+
+        self.tab_archive  = ArchiveTab(self.nb, self)
+        self.tab_restore  = RestoreTab(self.nb, self)
+        self.tab_verify   = VerifyTab(self.nb, self)
+        self.tab_jobs     = JobsTab(self.nb, self)
+        self.tab_inventory= InventoryTab(self.nb, self)
+        self.tab_tapes    = TapeTab(self.nb, self)
+        self.tab_library  = LibraryTab(self.nb, self)
+        self.tab_log      = LogTab(self.nb, self)
+
+        self.nb.add(self.tab_archive,   text="  Archive  ")
+        self.nb.add(self.tab_restore,   text="  Restore  ")
+        self.nb.add(self.tab_verify,    text="  Verify   ")
+        self.nb.add(self.tab_jobs,      text="  Jobs     ")
+        self.nb.add(self.tab_inventory, text="  Inventory")
+        self.nb.add(self.tab_tapes,     text="  Tapes    ")
+        self.nb.add(self.tab_library,   text="  Library  ")
+        self.nb.add(self.tab_log,       text="  Log      ")
+
+        # ── Bottom log strip ──────────────────────────────────────────────────
+        log_frame = ttk.Frame(self)
+        log_frame.pack(fill="x", padx=16, pady=(0, 8))
+        self.lbl_lastop = ttk.Label(log_frame, text="Ready.", style="Dim.TLabel")
+        self.lbl_lastop.pack(side="left")
+
+    def _refresh_status(self):
+        mounted = core.is_mounted(MOUNT)
+        if mounted:
+            free = core.human_size(core.tape_free_bytes(MOUNT))
+            total = core.human_size(core.tape_total_bytes(MOUNT))
+            self.lbl_tape_status.config(
+                text="● Tape: mounted at {}  ({} free / {})".format(MOUNT, free, total),
+                foreground=GREEN
+            )
+        else:
+            self.lbl_tape_status.config(
+                text="○ Tape: not mounted",
+                foreground=YELLOW
+            )
+
+        try:
+            stg_free = core.human_size(core.free_bytes(STAGING))
+            self.lbl_staging_status.config(
+                text="Staging ({}): {} free".format(STAGING, stg_free)
+            )
+        except Exception:
+            self.lbl_staging_status.config(text="Staging: unknown")
+
+        # Cleaning check in background thread
+        def _check_cleaning():
+            needs_clean, msg = core.cleaning_status_str(SG, ST)
+            self.after(0, lambda: self._update_cleaning_status(needs_clean, msg))
+        import threading
+        threading.Thread(target=_check_cleaning, daemon=True).start()
+
+        self.after(30000, self._auto_refresh)
+
+    def _update_cleaning_status(self, needs_clean, msg):
+        if needs_clean:
+            self.lbl_cleaning.config(
+                text="⚠  DRIVE NEEDS CLEANING — {}".format(msg),
+                foreground=RED
+            )
+            self.lbl_cleaning.pack(side="left", padx=(8, 0))
+        else:
+            self.lbl_cleaning.config(text="")
+            self.lbl_cleaning.pack_forget()
+
+    def _auto_refresh(self):
+        self._refresh_status()
+
+    def set_status(self, msg):
+        self.lbl_lastop.config(text=msg)
+        self.update_idletasks()
+
+    def refresh_all(self):
+        self._refresh_status()
+        self.tab_inventory.refresh()
+        self.tab_tapes.refresh()
+
+# ── Shared log widget mixin ───────────────────────────────────────────────────
+
+class LogMixin:
+    def _make_log(self, parent, height=8):
+        f = ttk.Frame(parent)
+        ttk.Label(f, text="Output:", style="Dim.TLabel").pack(anchor="w")
+        self.log_text = scrolledtext.ScrolledText(
+            f, height=height, bg=BG2, fg=FG, font=FONT_MONO,
+            insertbackground=FG, borderwidth=0, relief="flat",
+            state="disabled"
+        )
+        self.log_text.pack(fill="both", expand=True)
+        return f
+
+    def log(self, msg):
+        self.log_text.configure(state="normal")
+        self.log_text.insert("end", msg + "\n")
+        self.log_text.see("end")
+        self.log_text.configure(state="disabled")
+        if hasattr(self, "app"):
+            self.app.set_status(msg)
+
+    def log_clear(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.configure(state="disabled")
+
+# ── Archive Tab ───────────────────────────────────────────────────────────────
+
+class ArchiveTab(ttk.Frame, LogMixin):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.configure(style="TFrame")
+        self._build()
+
+    def _build(self):
+        # Left: form
+        left = ttk.Frame(self, padding=16)
+        left.pack(side="left", fill="y")
+
+        ttk.Label(left, text="Archive Dataset", font=FONT_H2,
+                  foreground=CYAN, background=BG).grid(row=0, column=0, columnspan=3,
+                                                        sticky="w", pady=(0,12))
+
+        fields = [
+            ("Source Path:",    "source_path",  ""),
+            ("Dataset Name:",   "name",         ""),
+            ("Tape Label:",     "tape_label",   ""),
+            ("Lab:",            "lab",          ""),
+            ("PI:",             "pi",           ""),
+            ("Notes:",          "notes",        ""),
+        ]
+        self.vars = {}
+        for i, (lbl, key, default) in enumerate(fields, start=1):
+            ttk.Label(left, text=lbl).grid(row=i, column=0, sticky="e", padx=(0,8), pady=4)
+            var = tk.StringVar(value=default)
+            self.vars[key] = var
+            if key == "source_path":
+                f = ttk.Frame(left)
+                f.grid(row=i, column=1, columnspan=2, sticky="ew", pady=4)
+                ttk.Entry(f, textvariable=var, width=38, font=FONT_SM).pack(side="left")
+                ttk.Button(f, text="Browse",
+                           command=self._browse_source).pack(side="left", padx=(4,0))
+            else:
+                ttk.Entry(left, textvariable=var, width=42,
+                          font=FONT_SM).grid(row=i, column=1, columnspan=2,
+                                             sticky="ew", pady=4)
+
+        # Tar bundle checkbox
+        row = len(fields) + 1
+        self.var_tar = tk.BooleanVar(value=TAR_DEF)
+        ttk.Checkbutton(left, text="Bundle as tar (recommended for many small files)",
+                        variable=self.var_tar).grid(row=row, column=0, columnspan=3,
+                                                     sticky="w", pady=4)
+
+        # Dry run checkbox
+        row += 1
+        self.var_dry = tk.BooleanVar(value=False)
+        ttk.Checkbutton(left, text="Dry run (no data written)",
+                        variable=self.var_dry).grid(row=row, column=0, columnspan=3,
+                                                     sticky="w", pady=4)
+
+        row += 1
+        self.progress = ttk.Progressbar(left, mode="indeterminate",
+                                         style="Horizontal.TProgressbar", length=300)
+        self.progress.grid(row=row, column=0, columnspan=3, sticky="ew", pady=8)
+
+        row += 1
+        btn_frame = ttk.Frame(left)
+        btn_frame.grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Button(btn_frame, text="Start Archive", style="Accent.TButton",
+                   command=self._start_archive).pack(side="left", padx=(0,8))
+        ttk.Button(btn_frame, text="Preflight Check",
+                   command=self._preflight).pack(side="left")
+
+        # Right: log
+        right = ttk.Frame(self, padding=16)
+        right.pack(side="right", fill="both", expand=True)
+        self._make_log(right, height=20).pack(fill="both", expand=True)
+
+    def _browse_source(self):
+        path = filedialog.askdirectory(title="Select source directory")
+        if path:
+            self.vars["source_path"].set(path)
+
+    def _preflight(self):
+        src = self.vars["source_path"].get().strip()
+        errors = core.preflight_check(src, STAGING, MOUNT, MIN_STG)
+        if errors:
+            messagebox.showwarning("Preflight Failed", "\n".join(errors))
+        else:
+            messagebox.showinfo("Preflight OK", "All preflight checks passed.")
+
+    @run_in_thread
+    def _start_archive(self):
+        self.log_clear()
+        self.progress.start()
+
+        try:
+            src    = self.vars["source_path"].get().strip()
+            name   = self.vars["name"].get().strip()
+            tape   = self.vars["tape_label"].get().strip().upper()
+            lab    = self.vars["lab"].get().strip()
+            pi     = self.vars["pi"].get().strip()
+            notes  = self.vars["notes"].get().strip()
+            use_tar= self.var_tar.get()
+            dry    = self.var_dry.get()
+
+            if not src or not name or not tape:
+                messagebox.showerror("Error",
+                    "Source path, name, and tape label are required.")
+                return
+
+            if dry:
+                # Dry run stays synchronous for immediate feedback
+                rec = core.archive_dataset(
+                    source_path=src, name=name, tape_label=tape,
+                    db_path=DB, staging_dir=STAGING, mount_point=MOUNT,
+                    checksum_algo=ALGO, use_tar=use_tar,
+                    lab=lab, pi=pi, notes=notes,
+                    progress_cb=self.log, dry_run=True
+                )
+                self.log("\n✔ Dry run complete — would create {}".format(rec.archive_id))
+                self.log("  Size: {}  Files: {}".format(
+                    core.human_size(rec.size_bytes), rec.file_count))
+                return
+
+            # Submit background job
+            job = core.submit_archive_job(
+                state_dir=STATE_DIR, db_path=DB,
+                source_path=src, name=name, tape_label=tape,
+                staging_dir=STAGING, mount_point=MOUNT,
+                checksum_algo=ALGO, use_tar=use_tar,
+                lab=lab, pi=pi, notes=notes,
+                cfg=cfg, sg_device=SG, st_device=ST,
+            )
+            self.log("✔ Archive job submitted: {}".format(job["job_id"]))
+            self.log("  Running in background — check the Jobs tab for progress.")
+            self.app.set_status("Archive job submitted: {}".format(job["job_id"]))
+            self.app.refresh_all()
+            messagebox.showinfo("Job Submitted",
+                "Archive job submitted!\n\n"
+                "Job ID: {}\n"
+                "Dataset: {}\n"
+                "Tape: {}\n\n"
+                "Running in background.\n"
+                "Check the Jobs tab for progress.".format(
+                    job["job_id"], name, tape))
+        except Exception as e:
+            self.log("\n✘ Error: {}".format(e))
+            self.app.set_status("Archive failed: {}".format(e))
+            messagebox.showerror("Archive Failed", str(e))
+        finally:
+            self.progress.stop()
+
+# ── Restore Tab ───────────────────────────────────────────────────────────────
+
+class RestoreTab(ttk.Frame, LogMixin):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        left = ttk.Frame(self, padding=16)
+        left.pack(side="left", fill="y")
+
+        ttk.Label(left, text="Restore Dataset", font=FONT_H2,
+                  foreground=CYAN, background=BG).pack(anchor="w", pady=(0,12))
+
+        # Archive selector
+        f1 = ttk.Frame(left)
+        f1.pack(fill="x", pady=4)
+        ttk.Label(f1, text="Archive ID:").pack(side="left", padx=(0,8))
+        self.var_id = tk.StringVar()
+        ttk.Entry(f1, textvariable=self.var_id, width=16,
+                  font=FONT_SM).pack(side="left")
+        ttk.Button(f1, text="Lookup",
+                   command=self._lookup).pack(side="left", padx=(8,0))
+
+        # Info display
+        self.info_text = tk.Text(left, height=7, width=50, bg=BG2, fg=FG,
+                                  font=FONT_MONO, state="disabled",
+                                  relief="flat", borderwidth=0)
+        self.info_text.pack(fill="x", pady=8)
+
+        # Destination
+        f2 = ttk.Frame(left)
+        f2.pack(fill="x", pady=4)
+        ttk.Label(f2, text="Destination:").pack(side="left", padx=(0,8))
+        self.var_dest = tk.StringVar(value=RESTORE)
+        ttk.Entry(f2, textvariable=self.var_dest, width=34,
+                  font=FONT_SM).pack(side="left")
+        ttk.Button(f2, text="Browse",
+                   command=self._browse_dest).pack(side="left", padx=(4,0))
+
+        self.progress = ttk.Progressbar(left, mode="indeterminate", length=300,
+                                         style="Horizontal.TProgressbar")
+        self.progress.pack(fill="x", pady=8)
+
+        ttk.Button(left, text="Start Restore", style="Accent.TButton",
+                   command=self._start_restore).pack(anchor="w")
+
+        # Right: archive list + log
+        right = ttk.Frame(self, padding=16)
+        right.pack(side="right", fill="both", expand=True)
+
+        ttk.Label(right, text="All Archives:", style="Dim.TLabel").pack(anchor="w")
+        self.tree = self._make_tree(right)
+        self.tree.pack(fill="both", expand=True, pady=(4, 8))
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.refresh()
+
+        self._make_log(right, height=6).pack(fill="both")
+
+    def _make_tree(self, parent):
+        cols = ("id", "name", "tape", "size", "date", "status")
+        t = ttk.Treeview(parent, columns=cols, show="headings", height=10)
+        for col, w, heading in [
+            ("id",   90,  "ID"),
+            ("name", 180, "Name"),
+            ("tape", 110, "Tape"),
+            ("size",  80, "Size"),
+            ("date",  95, "Date"),
+            ("status",80, "Status"),
+        ]:
+            t.heading(col, text=heading)
+            t.column(col, width=w, anchor="w")
+        sb = ttk.Scrollbar(parent, orient="vertical", command=t.yview)
+        t.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        return t
+
+    def refresh(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for a in core.list_archives(DB):
+            self.tree.insert("", "end", values=(
+                a.archive_id, a.name, a.tape_label,
+                core.human_size(a.size_bytes),
+                a.date_archived[:10] if a.date_archived else "",
+                a.status
+            ))
+
+    def _on_select(self, _):
+        sel = self.tree.selection()
+        if sel:
+            vals = self.tree.item(sel[0])["values"]
+            self.var_id.set(vals[0])
+            self._lookup()
+
+    def _lookup(self):
+        aid = self.var_id.get().strip().upper()
+        rec = core.get_archive(DB, aid)
+        self.info_text.configure(state="normal")
+        self.info_text.delete("1.0", "end")
+        if rec:
+            self.info_text.insert("end",
+                f"Archive ID:  {rec.archive_id}\n"
+                f"Name:        {rec.name}\n"
+                f"Tape:        {rec.tape_label}  ← load this tape\n"
+                f"Size:        {core.human_size(rec.size_bytes)}\n"
+                f"Files:       {rec.file_count}\n"
+                f"Date:        {rec.date_archived}\n"
+                f"Source was:  {rec.source_path}"
+            )
+        else:
+            self.info_text.insert("end", f"Archive ID '{aid}' not found.")
+        self.info_text.configure(state="disabled")
+
+    def _browse_dest(self):
+        path = filedialog.askdirectory(title="Select restore destination")
+        if path:
+            self.var_dest.set(path)
+
+    def _start_restore(self):
+        aid  = self.var_id.get().strip().upper()
+        dest = self.var_dest.get().strip()
+        if not aid or not dest:
+            messagebox.showerror("Error", "Archive ID and destination are required.")
+            return
+
+        self.log_clear()
+        self.progress.start()
+
+        try:
+            job = core.submit_restore_job(
+                state_dir=STATE_DIR, db_path=DB,
+                archive_id=aid, dest_path=dest,
+                mount_point=MOUNT, checksum_algo=ALGO,
+                cfg=cfg, sg_device=SG, st_device=ST,
+            )
+            self.log("✔ Restore job submitted: {}".format(job["job_id"]))
+            self.log("  Running in background — check the Jobs tab for progress.")
+            self.app.set_status("Restore job submitted: {}".format(job["job_id"]))
+            messagebox.showinfo("Job Submitted",
+                "Restore job submitted!\n\n"
+                "Job ID: {}\n"
+                "Archive: {}\n"
+                "Destination: {}\n\n"
+                "Running in background.\n"
+                "Check the Jobs tab for progress.".format(
+                    job["job_id"], aid, dest))
+            self.refresh()
+        except Exception as e:
+            self.log("\n✘ {}".format(e))
+            self.app.set_status("Restore failed: {}".format(e))
+            messagebox.showerror("Restore Failed", str(e))
+        finally:
+            self.progress.stop()
+
+# ── Verify Tab ────────────────────────────────────────────────────────────────
+
+class VerifyTab(ttk.Frame, LogMixin):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        left = ttk.Frame(self, padding=16)
+        left.pack(side="left", fill="y")
+
+        ttk.Label(left, text="Verify Archives", font=FONT_H2,
+                  foreground=CYAN, background=BG).pack(anchor="w", pady=(0,12))
+
+        f1 = ttk.Frame(left)
+        f1.pack(fill="x", pady=4)
+        ttk.Label(f1, text="Archive ID:").pack(side="left", padx=(0,8))
+        self.var_id = tk.StringVar()
+        ttk.Entry(f1, textvariable=self.var_id, width=14, font=FONT_SM).pack(side="left")
+
+        ttk.Button(left, text="Verify This Archive",
+                   command=self._verify_one).pack(anchor="w", pady=4)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=12)
+
+        f2 = ttk.Frame(left)
+        f2.pack(fill="x", pady=4)
+        ttk.Label(f2, text="Tape Label:").pack(side="left", padx=(0,8))
+        self.var_tape = tk.StringVar()
+        ttk.Entry(f2, textvariable=self.var_tape, width=14, font=FONT_SM).pack(side="left")
+
+        ttk.Button(left, text="Verify All on Tape",
+                   command=self._verify_tape).pack(anchor="w", pady=4)
+
+        self.progress = ttk.Progressbar(left, mode="indeterminate", length=250,
+                                         style="Horizontal.TProgressbar")
+        self.progress.pack(fill="x", pady=12)
+
+        right = ttk.Frame(self, padding=16)
+        right.pack(side="right", fill="both", expand=True)
+        self._make_log(right, height=24).pack(fill="both", expand=True)
+
+    def _verify_one(self):
+        aid = self.var_id.get().strip().upper()
+        if not aid:
+            return
+        self.log_clear()
+        self.progress.start()
+        try:
+            job = core.submit_verify_job(
+                state_dir=STATE_DIR, db_path=DB,
+                archive_id=aid, mount_point=MOUNT, checksum_algo=ALGO,
+            )
+            self.log("✔ Verify job submitted: {}".format(job["job_id"]))
+            self.log("  Check Jobs tab for result.")
+            self.app.refresh_all()
+        except Exception as e:
+            self.log("\n✘ {}".format(e))
+        finally:
+            self.progress.stop()
+
+    def _verify_tape(self):
+        tape = self.var_tape.get().strip().upper()
+        if not tape:
+            return
+        self.log_clear()
+        self.progress.start()
+        try:
+            archives = core.list_archives(DB, tape_label=tape)
+            for a in archives:
+                job = core.submit_verify_job(
+                    state_dir=STATE_DIR, db_path=DB,
+                    archive_id=a.archive_id,
+                    mount_point=MOUNT, checksum_algo=ALGO,
+                )
+                self.log("Submitted {} for {}".format(job["job_id"], a.archive_id))
+            if archives:
+                self.log("All verify jobs submitted — check Jobs tab.")
+            else:
+                self.log("No archives found for tape '{}'.".format(tape))
+            self.app.refresh_all()
+        except Exception as e:
+            self.log("\n✘ {}".format(e))
+        finally:
+            self.progress.stop()
+
+# ── Jobs Tab ──────────────────────────────────────────────────────────────────
+
+class JobsTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._build()
+        self.after(5000, self._auto_refresh)
+
+    def _build(self):
+        top = ttk.Frame(self, padding=(16, 8))
+        top.pack(fill="x")
+        ttk.Label(top, text="Background Jobs", font=FONT_H2,
+                  foreground=CYAN, background=BG).pack(side="left")
+        ttk.Button(top, text="⟳ Refresh", command=self.refresh).pack(side="right")
+        ttk.Button(top, text="Cancel Job",
+                   command=self._cancel_job).pack(side="right", padx=(0,8))
+        ttk.Button(top, text="Clean Up Old Jobs",
+                   command=self._cleanup).pack(side="right", padx=(0,8))
+
+        # Treeview
+        frame = ttk.Frame(self, padding=(16,4))
+        frame.pack(fill="both", expand=True)
+
+        cols = ("job_id","type","dataset","status","progress","started","finished")
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for col, w, heading in [
+            ("job_id",   90,  "Job ID"),
+            ("type",     70,  "Type"),
+            ("dataset", 180,  "Dataset / Archive"),
+            ("status",   90,  "Status"),
+            ("progress",280,  "Progress"),
+            ("started",  130, "Started"),
+            ("finished", 130, "Finished"),
+        ]:
+            self.tree.heading(col, text=heading)
+            self.tree.column(col, width=w, anchor="w")
+
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        self.tree.tag_configure("running",   foreground=CYAN)
+        self.tree.tag_configure("complete",  foreground=GREEN)
+        self.tree.tag_configure("failed",    foreground=RED)
+        self.tree.tag_configure("cancelled", foreground=FG_DIM)
+        self.tree.tag_configure("queued",    foreground=YELLOW)
+
+        # Detail strip
+        det = ttk.Frame(self, padding=(16,4))
+        det.pack(fill="x")
+        self.lbl_detail = ttk.Label(det, text="", style="Dim.TLabel")
+        self.lbl_detail.pack(side="left")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        self.refresh()
+
+    def refresh(self):
+        sel = self.tree.selection()
+        sel_id = self.tree.item(sel[0])["values"][0] if sel else None
+
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+
+        jobs = core.list_jobs(STATE_DIR)
+        for j in jobs:
+            status   = j.get("status","")
+            dataset  = j.get("name") or j.get("archive_id") or "—"
+            finished = (j.get("finished") or "")[:16] or "—"
+            iid = self.tree.insert("", "end", iid=j.get("job_id",""),
+                values=(
+                    j.get("job_id",""),
+                    j.get("type",""),
+                    dataset,
+                    status,
+                    j.get("progress",""),
+                    (j.get("started") or "")[:16],
+                    finished,
+                ), tags=(status,))
+
+        # Update status bar active job count
+        active = sum(1 for j in jobs if j.get("status") == core.JOB_STATUS_RUNNING)
+        if active:
+            self.app.set_status("{} job{} running".format(
+                active, "s" if active != 1 else ""))
+
+        # Restore selection
+        if sel_id:
+            try:
+                self.tree.selection_set(sel_id)
+            except Exception:
+                pass
+
+    def _on_select(self, _):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        job_id = sel[0]
+        j = core.get_job(STATE_DIR, job_id)
+        if j:
+            err = "  Error: {}".format(j["error"]) if j.get("error") else ""
+            self.lbl_detail.config(
+                text="{}  {}  {}{}".format(
+                    j.get("job_id",""), j.get("type",""),
+                    j.get("progress",""), err)
+            )
+
+    def _cancel_job(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Cancel Job", "Select a job to cancel.")
+            return
+        job_id = sel[0]
+        if messagebox.askyesno("Cancel Job",
+                               "Cancel job {}?".format(job_id)):
+            if core.cancel_job(STATE_DIR, job_id):
+                self.refresh()
+            else:
+                messagebox.showerror("Error",
+                    "Could not cancel {} — not running or not found.".format(job_id))
+
+    def _cleanup(self):
+        removed = core.cleanup_jobs(STATE_DIR, keep_days=7)
+        self.refresh()
+        messagebox.showinfo("Cleanup",
+            "Removed {} completed job file{}.".format(
+                removed, "s" if removed != 1 else ""))
+
+    def _auto_refresh(self):
+        self.refresh()
+        self.after(5000, self._auto_refresh)
+
+# ── Inventory Tab ─────────────────────────────────────────────────────────────
+
+class InventoryTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        top = ttk.Frame(self, padding=(16, 8))
+        top.pack(fill="x")
+
+        ttk.Label(top, text="Archive Inventory", font=FONT_H2,
+                  foreground=CYAN, background=BG).pack(side="left")
+
+        # Search
+        sf = ttk.Frame(top)
+        sf.pack(side="right")
+        self.var_search = tk.StringVar()
+        ttk.Entry(sf, textvariable=self.var_search, width=24,
+                  font=FONT_SM).pack(side="left", padx=(0,4))
+        ttk.Button(sf, text="Search", command=self.refresh).pack(side="left", padx=(0,4))
+        ttk.Button(sf, text="Clear", command=self._clear_search).pack(side="left", padx=(0,8))
+        ttk.Button(sf, text="Export CSV", command=self._export_csv).pack(side="left")
+
+        # Filter row
+        ff = ttk.Frame(self, padding=(16,0))
+        ff.pack(fill="x")
+        ttk.Label(ff, text="Lab filter:").pack(side="left", padx=(0,4))
+        self.var_lab = tk.StringVar()
+        ttk.Entry(ff, textvariable=self.var_lab, width=16, font=FONT_SM).pack(side="left",padx=(0,8))
+        ttk.Label(ff, text="Tape filter:").pack(side="left", padx=(0,4))
+        self.var_tape = tk.StringVar()
+        ttk.Entry(ff, textvariable=self.var_tape, width=16, font=FONT_SM).pack(side="left",padx=(0,8))
+        ttk.Button(ff, text="Apply Filters", command=self.refresh).pack(side="left")
+
+        # Treeview
+        frame = ttk.Frame(self, padding=(16, 4))
+        frame.pack(fill="both", expand=True)
+
+        cols = ("id","name","lab","pi","tape","size","files","date","status","notes")
+        self.tree = ttk.Treeview(frame, columns=cols, show="headings")
+        for col, w, heading in [
+            ("id",    90, "ID"),
+            ("name", 160, "Name"),
+            ("lab",  100, "Lab"),
+            ("pi",    90, "PI"),
+            ("tape", 110, "Tape"),
+            ("size",  80, "Size"),
+            ("files",  70, "Files"),
+            ("date",   95, "Date"),
+            ("status", 80, "Status"),
+            ("notes", 150, "Notes"),
+        ]:
+            self.tree.heading(col, text=heading,
+                              command=lambda c=col: self._sort(c))
+            self.tree.column(col, width=w, anchor="w")
+
+        vsb = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+
+        self.tree.tag_configure("verified", foreground=GREEN)
+        self.tree.tag_configure("corrupt",  foreground=RED)
+        self.tree.tag_configure("restored", foreground=BLUE)
+
+        # Detail panel
+        det = ttk.Frame(self, padding=(16, 4))
+        det.pack(fill="x")
+        self.lbl_detail = ttk.Label(det, text="Select an archive to see details.",
+                                     style="Dim.TLabel")
+        self.lbl_detail.pack(side="left")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+        self.refresh()
+
+    def refresh(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        archives = core.list_archives(
+            DB,
+            search=self.var_search.get().strip() or None,
+            lab=self.var_lab.get().strip() or None,
+            tape_label=self.var_tape.get().strip().upper() or None,
+        )
+        for a in archives:
+            tag = a.status if a.status in ("verified","corrupt","restored") else ""
+            self.tree.insert("", "end", iid=a.archive_id, values=(
+                a.archive_id, a.name, a.lab or "—", a.pi or "—",
+                a.tape_label, core.human_size(a.size_bytes),
+                a.file_count,
+                a.date_archived[:10] if a.date_archived else "—",
+                a.status,
+                (a.notes or "")[:40]
+            ), tags=(tag,))
+
+    def _clear_search(self):
+        self.var_search.set("")
+        self.var_lab.set("")
+        self.var_tape.set("")
+        self.refresh()
+
+    def _on_select(self, _):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        aid = sel[0]
+        rec = core.get_archive(DB, aid)
+        if rec:
+            self.lbl_detail.config(
+                text=f"{rec.archive_id}  •  {rec.name}  •  Tape: {rec.tape_label}  "
+                     f"•  {core.human_size(rec.size_bytes)}  •  {rec.date_archived}  "
+                     f"•  Source: {rec.source_path}"
+            )
+
+    def _sort(self, col):
+        data = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
+        data.sort()
+        for i, (_, k) in enumerate(data):
+            self.tree.move(k, "", i)
+
+    def _export_csv(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv")],
+            initialfile="tapeman2_export.csv"
+        )
+        if path:
+            tape = self.var_tape.get().strip().upper() or None
+            core.export_csv(DB, path, tape_label=tape)
+            messagebox.showinfo("Export", f"Exported to:\n{path}")
+
+# ── Tape Management Tab ───────────────────────────────────────────────────────
+
+class TapeTab(ttk.Frame, LogMixin):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        left = ttk.Frame(self, padding=16)
+        left.pack(side="left", fill="y")
+
+        ttk.Label(left, text="Tape Management", font=FONT_H2,
+                  foreground=CYAN, background=BG).pack(anchor="w", pady=(0,12))
+
+        ttk.Button(left, text="Mount Tape",
+                   command=self._mount).pack(fill="x", pady=3)
+        ttk.Button(left, text="Unmount & Eject",
+                   command=self._unmount).pack(fill="x", pady=3)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=12)
+
+        ttk.Label(left, text="Format New Tape", foreground=YELLOW,
+                  background=BG).pack(anchor="w")
+        f = ttk.Frame(left)
+        f.pack(fill="x", pady=4)
+        ttk.Label(f, text="Label:").pack(side="left", padx=(0,8))
+        self.var_fmt_label = tk.StringVar()
+        ttk.Entry(f, textvariable=self.var_fmt_label, width=16,
+                  font=FONT_SM).pack(side="left")
+        ttk.Button(left, text="Format Tape", style="Danger.TButton",
+                   command=self._format).pack(anchor="w", pady=4)
+
+        ttk.Separator(left, orient="horizontal").pack(fill="x", pady=12)
+
+        ttk.Label(left, text="Register Tape in DB",
+                  background=BG).pack(anchor="w")
+        f2 = ttk.Frame(left)
+        f2.pack(fill="x", pady=4)
+        ttk.Label(f2, text="Label:").pack(side="left", padx=(0,8))
+        self.var_reg_label = tk.StringVar()
+        ttk.Entry(f2, textvariable=self.var_reg_label, width=16,
+                  font=FONT_SM).pack(side="left")
+        self.var_reg_notes = tk.StringVar()
+        ttk.Entry(left, textvariable=self.var_reg_notes, width=32,
+                  font=FONT_SM).pack(fill="x", pady=2)
+        ttk.Button(left, text="Register",
+                   command=self._register).pack(anchor="w", pady=4)
+
+        self.progress = ttk.Progressbar(left, mode="indeterminate", length=250,
+                                         style="Horizontal.TProgressbar")
+        self.progress.pack(fill="x", pady=12)
+
+        # Right: tape list + log
+        right = ttk.Frame(self, padding=16)
+        right.pack(side="right", fill="both", expand=True)
+
+        ttk.Label(right, text="Tape Inventory:", style="Dim.TLabel").pack(anchor="w")
+        cols = ("label","archives","size","first_used","last_verified","notes")
+        self.tree = ttk.Treeview(right, columns=cols, show="headings", height=8)
+        for col, w, heading in [
+            ("label",       120, "Label"),
+            ("archives",     70, "Archives"),
+            ("size",         90, "Total Data"),
+            ("first_used",  100, "First Used"),
+            ("last_verified",110,"Last Verified"),
+            ("notes",       200, "Notes"),
+        ]:
+            self.tree.heading(col, text=heading)
+            self.tree.column(col, width=w, anchor="w")
+        self.tree.pack(fill="both", expand=True, pady=(4,8))
+        self.refresh()
+
+        self._make_log(right, height=6).pack(fill="both")
+
+    def refresh(self):
+        for row in self.tree.get_children():
+            self.tree.delete(row)
+        for tp in core.list_tapes(DB):
+            lv = tp.last_verified[:10] if tp.last_verified else "Never"
+            self.tree.insert("", "end", values=(
+                tp.label, tp.total_archives,
+                core.human_size(tp.total_bytes),
+                tp.date_first_used[:10] if tp.date_first_used else "—",
+                lv, tp.notes or "—"
+            ))
+
+    @run_in_thread
+    def _mount(self):
+        self.progress.start()
+        self.log_clear()
+        try:
+            core.mount_tape(SG, MOUNT, progress_cb=self.log)
+            self.log(f"✔ Mounted at {MOUNT}")
+            self.app._refresh_status()
+        except core.TapeError as e:
+            self.log(f"✘ {e}")
+        finally:
+            self.progress.stop()
+
+    @run_in_thread
+    @run_in_thread
+    def _unmount(self):
+        self.progress.start()
+        self.log_clear()
+        # Check cleaning before unmount while drive is accessible
+        self.log("Checking drive cleaning status...")
+        needs_clean, clean_msg = core.cleaning_status_str(SG, ST)
+        try:
+            core.unmount_tape(MOUNT, progress_cb=self.log)
+            self.log("✔ Unmounted.")
+            core.eject_tape(ST)
+            self.log("✔ Tape ejected.")
+            self.app._refresh_status()
+            # Show cleaning warning after successful eject
+            if needs_clean:
+                self.log("\n⚠  DRIVE NEEDS CLEANING")
+                self.log("   Reason: {}".format(clean_msg))
+                self.log("   Load a cleaning cartridge before the next archive job.")
+                core.log_cleaning_event(DB, SG, action="cleaning_needed",
+                                        notes=clean_msg)
+                self.log("   (Logged to maintenance log.)")
+                # Show popup on main thread
+                self.after(0, lambda: messagebox.showwarning(
+                    "Drive Cleaning Required",
+                    "The tape drive needs cleaning.\n\n"
+                    "Reason: {}\n\n"
+                    "Please load a cleaning cartridge before\n"
+                    "your next archive job.".format(clean_msg)
+                ))
+        except core.TapeError as e:
+            self.log("✘ {}".format(e))
+        finally:
+            self.progress.stop()
+
+    @run_in_thread
+    def _format(self):
+        label = self.var_fmt_label.get().strip().upper()
+        if not label:
+            messagebox.showerror("Error", "Tape label required.")
+            return
+        if not messagebox.askyesno("Confirm Format",
+                                    f"ERASE ALL DATA on tape and format as '{label}'?\n\n"
+                                    "This cannot be undone."):
+            return
+        self.progress.start()
+        self.log_clear()
+        try:
+            core.format_tape(SG, label, progress_cb=self.log)
+            core.add_tape(DB, label)
+            self.log(f"✔ Tape '{label}' formatted and registered.")
+            self.refresh()
+            self.app._refresh_status()
+        except core.TapeError as e:
+            self.log(f"✘ {e}")
+        finally:
+            self.progress.stop()
+
+    def _register(self):
+        label = self.var_reg_label.get().strip().upper()
+        notes = self.var_reg_notes.get().strip()
+        if not label:
+            messagebox.showerror("Error", "Label required.")
+            return
+        core.add_tape(DB, label, notes)
+        self.log(f"Registered tape: {label}")
+        self.refresh()
+
+# ── Library Tab ───────────────────────────────────────────────────────────────
+
+class LibraryTab(ttk.Frame, LogMixin):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._status = None
+        self._build()
+
+    def _build(self):
+        # Check if changer is enabled
+        if not core.changer_enabled(cfg):
+            ttk.Label(self, text="Library / Changer Support",
+                      font=FONT_H2, foreground=CYAN, background=BG).pack(pady=(24,8))
+            ttk.Label(self,
+                      text="Changer support is disabled.\n\n"
+                           "To enable, set enabled = true in:\n"
+                           "/etc/tapeman2/tapeman2.conf  [changer] section\n\n"
+                           "Also ensure 'mtx' is installed:\n"
+                           "  dnf install mtx",
+                      background=BG, foreground=FG_DIM, font=FONT,
+                      justify="center").pack(pady=8)
+            return
+
+        top = ttk.Frame(self, padding=(16, 8))
+        top.pack(fill="x")
+        ttk.Label(top, text="Tape Library", font=FONT_H2,
+                  foreground=CYAN, background=BG).pack(side="left")
+
+        self.lbl_changer = ttk.Label(top,
+            text="Changer: {}".format(core.get_changer_device(cfg)),
+            style="Dim.TLabel")
+        self.lbl_changer.pack(side="left", padx=16)
+
+        ttk.Button(top, text="⟳ Refresh Status",
+                   command=self._refresh).pack(side="right")
+        ttk.Button(top, text="Run Inventory Scan",
+                   command=self._inventory).pack(side="right", padx=(0, 8))
+
+        # ── Slot map canvas ───────────────────────────────────────────────────
+        map_frame = ttk.Frame(self, padding=(16, 4))
+        map_frame.pack(fill="both", expand=True)
+
+        ttk.Label(map_frame, text="Library Slot Map:", style="Dim.TLabel").pack(anchor="w")
+
+        canvas_frame = ttk.Frame(map_frame)
+        canvas_frame.pack(fill="both", expand=True)
+
+        self.canvas = tk.Canvas(canvas_frame, bg=BG2, highlightthickness=0)
+        vsb = ttk.Scrollbar(canvas_frame, orient="vertical",
+                             command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        # ── Drive controls ────────────────────────────────────────────────────
+        ctrl = ttk.Frame(self, padding=(16, 4))
+        ctrl.pack(fill="x")
+
+        ttk.Label(ctrl, text="Manual Controls:", foreground=YELLOW,
+                  background=BG).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0,4))
+
+        ttk.Label(ctrl, text="Drive:").grid(row=1, column=0, padx=(0,4))
+        self.var_drive = tk.StringVar(value="0")
+        ttk.Entry(ctrl, textvariable=self.var_drive, width=4,
+                  font=FONT_SM).grid(row=1, column=1, padx=(0,8))
+
+        ttk.Label(ctrl, text="Slot:").grid(row=1, column=2, padx=(0,4))
+        self.var_slot = tk.StringVar(value="1")
+        ttk.Entry(ctrl, textvariable=self.var_slot, width=4,
+                  font=FONT_SM).grid(row=1, column=3, padx=(0,8))
+
+        ttk.Button(ctrl, text="Load Slot → Drive",
+                   command=self._manual_load).grid(row=1, column=4, padx=(0,4))
+        ttk.Button(ctrl, text="Unload Drive → Slot",
+                   command=self._manual_unload).grid(row=1, column=5, padx=(0,4))
+
+        ttk.Label(ctrl, text="Tape Label:").grid(row=2, column=0, padx=(0,4), pady=4)
+        self.var_find_label = tk.StringVar()
+        ttk.Entry(ctrl, textvariable=self.var_find_label, width=16,
+                  font=FONT_SM).grid(row=2, column=1, columnspan=2, padx=(0,8))
+        ttk.Button(ctrl, text="Find & Load by Label",
+                   command=self._find_and_load).grid(row=2, column=3, columnspan=2,
+                                                      padx=(0,4))
+
+        self.progress = ttk.Progressbar(self, mode="indeterminate", length=400,
+                                         style="Horizontal.TProgressbar")
+        self.progress.pack(padx=16, pady=4, fill="x")
+
+        log_frame = ttk.Frame(self, padding=(16, 4))
+        log_frame.pack(fill="x")
+        self._make_log(log_frame, height=5).pack(fill="both")
+
+        self._refresh()
+
+    def _refresh(self):
+        if not core.changer_enabled(cfg):
+            return
+        try:
+            self._status = core.library_status_with_db(
+                core.get_changer_device(cfg), DB)
+            self._draw_map()
+        except Exception as e:
+            self.log("Error reading library status: {}".format(e))
+
+    def _draw_map(self):
+        self.canvas.delete("all")
+        if not self._status:
+            return
+
+        x0, y0 = 10, 10
+        slot_w, slot_h, pad = 90, 36, 6
+        cols = 8
+
+        def draw_slot(idx, slot, x, y):
+            color = GREEN if slot.occupied else BG3
+            fg = BG if slot.occupied else FG_DIM
+            self.canvas.create_rectangle(x, y, x+slot_w, y+slot_h,
+                                          fill=color, outline=BG, width=1)
+            label = slot.barcode or slot.label or "(empty)"
+            type_str = {"drive":"DRV","storage":"S","ie":"I/E"}.get(
+                slot.slot_type, "?")
+            self.canvas.create_text(x + slot_w//2, y + 10,
+                                     text="{}{} {}".format(
+                                         type_str, slot.slot_num,
+                                         ("*LOADED*" if slot.slot_type=="drive"
+                                          and slot.occupied else "")),
+                                     fill=CYAN, font=("Courier", 7, "bold"),
+                                     anchor="center")
+            self.canvas.create_text(x + slot_w//2, y + 24,
+                                     text=label[:12],
+                                     fill=fg, font=("Courier", 7),
+                                     anchor="center")
+
+        all_slots = self._status.drives + self._status.ie_slots + self._status.slots
+        for i, slot in enumerate(all_slots):
+            col = i % cols
+            row = i // cols
+            x = x0 + col * (slot_w + pad)
+            y = y0 + row * (slot_h + pad)
+            draw_slot(i, slot, x, y)
+
+        total_h = y0 + ((len(all_slots) // cols) + 1) * (slot_h + pad) + 20
+        self.canvas.configure(scrollregion=(0, 0, x0 + cols*(slot_w+pad), total_h))
+
+    @run_in_thread
+    def _inventory(self):
+        self.progress.start()
+        self.log_clear()
+        try:
+            core.changer_inventory_scan(
+                core.get_changer_device(cfg), DB, progress_cb=self.log)
+            self._refresh()
+            self.log("Inventory scan complete.")
+        except Exception as e:
+            self.log("Error: {}".format(e))
+        finally:
+            self.progress.stop()
+
+    @run_in_thread
+    def _manual_load(self):
+        try:
+            slot = int(self.var_slot.get())
+            drive = int(self.var_drive.get())
+        except ValueError:
+            messagebox.showerror("Error", "Slot and drive must be integers.")
+            return
+        self.progress.start()
+        self.log_clear()
+        try:
+            ch = core._get_changer()
+            ch.load_tape(core.get_changer_device(cfg), slot, drive,
+                         progress_cb=self.log)
+            core._log_changer_op(DB, "load", slot, drive, "", "ok")
+            self._refresh()
+        except Exception as e:
+            self.log("Error: {}".format(e))
+        finally:
+            self.progress.stop()
+
+    @run_in_thread
+    def _manual_unload(self):
+        try:
+            slot = int(self.var_slot.get())
+            drive = int(self.var_drive.get())
+        except ValueError:
+            messagebox.showerror("Error", "Slot and drive must be integers.")
+            return
+        self.progress.start()
+        self.log_clear()
+        try:
+            ch = core._get_changer()
+            ch.unload_tape(core.get_changer_device(cfg), slot, drive,
+                           progress_cb=self.log)
+            core._log_changer_op(DB, "unload", slot, drive, "", "ok")
+            self._refresh()
+        except Exception as e:
+            self.log("Error: {}".format(e))
+        finally:
+            self.progress.stop()
+
+    @run_in_thread
+    def _find_and_load(self):
+        label = self.var_find_label.get().strip().upper()
+        if not label:
+            messagebox.showerror("Error", "Enter a tape label.")
+            return
+        drive = int(self.var_drive.get() or "0")
+        self.progress.start()
+        self.log_clear()
+        try:
+            slot = core.changer_load(
+                core.get_changer_device(cfg), label, drive,
+                db_path=DB, progress_cb=self.log)
+            self.log("Tape '{}' loaded from slot {}.".format(label, slot))
+            self._refresh()
+            self.app._refresh_status()
+        except Exception as e:
+            self.log("Error: {}".format(e))
+        finally:
+            self.progress.stop()
+
+# ── Log Tab ───────────────────────────────────────────────────────────────────
+
+class LogTab(ttk.Frame):
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        top = ttk.Frame(self, padding=(16, 8))
+        top.pack(fill="x")
+        ttk.Label(top, text="Activity Log", font=FONT_H2,
+                  foreground=CYAN, background=BG).pack(side="left")
+        ttk.Button(top, text="Refresh", command=self._load).pack(side="right")
+
+        self.text = scrolledtext.ScrolledText(
+            self, bg=BG2, fg=FG, font=FONT_MONO,
+            state="disabled", borderwidth=0, relief="flat"
+        )
+        self.text.pack(fill="both", expand=True, padx=16, pady=8)
+        self._load()
+
+    def _load(self):
+        log_file = cfg.get("paths", "log_file",
+                           fallback="/var/log/tapeman2/tapeman2.log")
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        try:
+            with open(log_file) as f:
+                lines = f.readlines()
+            self.text.insert("end", "".join(lines[-200:]))
+        except FileNotFoundError:
+            self.text.insert("end", "Log file not found. No operations logged yet.")
+        except Exception as e:
+            self.text.insert("end", f"Error reading log: {e}")
+        self.text.see("end")
+        self.text.configure(state="disabled")
+
+# ── Entry Point ───────────────────────────────────────────────────────────────
+
+def _check_permissions():
+    import grp
+    if os.geteuid() == 0:
+        return
+    sg = cfg.get("device", "sg_device", fallback="/dev/sg0")
+    if os.access(sg, os.R_OK | os.W_OK):
+        return
+    try:
+        tape_gid = grp.getgrnam("tape").gr_gid
+        if tape_gid in os.getgroups():
+            return
+    except KeyError:
+        pass
+    try:
+        import tkinter.messagebox as mb
+        mb.showerror(
+            "Permission Denied",
+            "Cannot access tape device: {}\n\n"
+            "Ask your administrator to run:\n"
+            "  sudo chmod 666 {}\n\n"
+            "or add you to the tape group:\n"
+            "  sudo usermod -aG tape {}\n"
+            "(then log out and back in)".format(
+                sg, sg, os.environ.get("USER", "your-username"))
+        )
+    except Exception:
+        print("Permission denied: cannot access {}".format(sg))
+    sys.exit(1)
+
+
+def main():
+    _check_permissions()
+
+    app = TapeMan2App()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()

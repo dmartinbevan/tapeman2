@@ -1,0 +1,1182 @@
+#!/usr/bin/env python3
+"""
+tapeman2 — Terminal UI for tape archival management
+Uses 'rich' for formatting if available, falls back to plain text.
+"""
+
+import os
+import sys
+import threading
+from datetime import datetime
+from pathlib import Path
+
+# ── Try to import rich ────────────────────────────────────────────────────────
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.prompt import Prompt, Confirm
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+    from rich.text import Text
+    from rich import box
+    RICH = True
+except ImportError:
+    RICH = False
+
+sys.path.insert(0, "/usr/local/lib/tapeman2")
+import tapeman2_core as core
+
+# ── Console setup ─────────────────────────────────────────────────────────────
+if RICH:
+    console = Console()
+else:
+    class _Console:
+        def print(self, *args, **kwargs):
+            # Strip rich markup
+            import re
+            text = " ".join(str(a) for a in args)
+            text = re.sub(r"\[.*?\]", "", text)
+            print(text)
+        def clear(self):
+            os.system("clear")
+        def rule(self, title=""):
+            print(f"\n{'─'*60}  {title}  {'─'*60}\n" if title else "─"*80)
+    console = _Console()
+
+# ── Config ────────────────────────────────────────────────────────────────────
+cfg       = core.initialize()
+DB        = cfg.get("paths", "db_path")
+MOUNT     = cfg.get("device", "mount_point")
+SG        = cfg.get("device", "sg_device")
+ST        = cfg.get("device", "st_device")
+STAGING   = cfg.get("paths", "staging_dir")
+RESTORE   = cfg.get("paths", "restore_dir")
+STATE_DIR = cfg.get("paths", "state_dir",
+                    fallback=core._get_platform().DEFAULT_STATE_DIR)
+ALGO      = cfg.get("archive", "checksum_algo", fallback="sha256")
+MIN_STG   = cfg.getint("archive", "min_staging_free_gb", fallback=50)
+TAR_DEF   = cfg.getboolean("archive", "tar_by_default", fallback=False)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def clear():
+    console.clear()
+
+def pause():
+    input("\nPress Enter to continue...")
+
+def header(subtitle=""):
+    clear()
+    if RICH:
+        console.print(Panel.fit(
+            f"[bold cyan]TapeMan 2[/bold cyan]  [dim]Quantum LTO-9 Archive Manager[/dim]\n"
+            f"[dim]{subtitle}[/dim]" if subtitle else
+            "[bold cyan]TapeMan 2[/bold cyan]  [dim]Quantum LTO-9 Archive Manager[/dim]",
+            border_style="cyan"
+        ))
+    else:
+        print("=" * 60)
+        print("  TapeMan 2 — Quantum LTO-9 Archive Manager")
+        if subtitle:
+            print(f"  {subtitle}")
+        print("=" * 60)
+    print()
+
+def status_line():
+    mounted = core.is_mounted(MOUNT)
+    if RICH:
+        if mounted:
+            free_str = _tape_free_nonblocking()
+            console.print("  Tape: [green]● Mounted at {}[/green]  "
+                          "[dim]({})[/dim]".format(MOUNT, free_str))
+        else:
+            console.print("  Tape: [yellow]○ Not mounted[/yellow]")
+    else:
+        if mounted:
+            free_str = _tape_free_nonblocking()
+            print("  Tape: MOUNTED at {} ({})".format(MOUNT, free_str))
+        else:
+            print("  Tape: not mounted")
+
+    # Active jobs
+    active = core.active_job_count(STATE_DIR)
+    if active:
+        if RICH:
+            console.print("  Jobs: [cyan]⚙ {} job{} running[/cyan]".format(
+                active, "s" if active != 1 else ""))
+        else:
+            print("  Jobs: {} job{} running".format(
+                active, "s" if active != 1 else ""))
+
+    # Cleaning status
+    needs_clean, clean_msg = _cleaning_status_nonblocking()
+    if needs_clean:
+        if RICH:
+            console.print("  Drive: [bold red]⚠  CLEANING REQUIRED — {}[/bold red]".format(
+                clean_msg))
+        else:
+            print("  Drive: *** CLEANING REQUIRED — {} ***".format(clean_msg))
+    print()
+
+def _cleaning_status_nonblocking():
+    """Get cleaning status with timeout — returns (bool, str)."""
+    import threading
+    result = [False, ""]
+    def _check():
+        try:
+            result[0], result[1] = core.cleaning_status_str(SG, ST)
+        except Exception:
+            pass
+    t = threading.Thread(target=_check, daemon=True)
+    t.start()
+    t.join(timeout=3)
+    return result[0], result[1]
+
+def _tape_free_nonblocking():
+    """Get tape free space with a 2s timeout — returns string."""
+    import threading
+    result = [None]
+    def _get():
+        try:
+            result[0] = core.human_size(core.tape_free_bytes(MOUNT))
+        except Exception:
+            result[0] = "unknown"
+    t = threading.Thread(target=_get, daemon=True)
+    t.start()
+    t.join(timeout=2)
+    return result[0] if result[0] else "calculating..."
+
+def prompt(msg, default=""):
+    if RICH:
+        return Prompt.ask(f"  [cyan]{msg}[/cyan]", default=default)
+    else:
+        d = f" [{default}]" if default else ""
+        return input(f"  {msg}{d}: ").strip() or default
+
+def confirm(msg, default=True):
+    if RICH:
+        return Confirm.ask(f"  [cyan]{msg}[/cyan]", default=default)
+    else:
+        d = "Y/n" if default else "y/N"
+        r = input(f"  {msg} [{d}]: ").strip().lower()
+        if not r:
+            return default
+        return r.startswith("y")
+
+def info(msg):
+    if RICH:
+        console.print(f"  [green]✔[/green] {msg}")
+    else:
+        print(f"  ✔ {msg}")
+
+def warn(msg):
+    if RICH:
+        console.print(f"  [yellow]⚠[/yellow]  {msg}")
+    else:
+        print(f"  ⚠  {msg}")
+
+def error(msg):
+    if RICH:
+        console.print(f"  [red]✘[/red]  {msg}")
+    else:
+        print(f"  ✘  {msg}")
+
+def progress_msg(msg):
+    if RICH:
+        console.print(f"  [dim]→[/dim] {msg}")
+    else:
+        print(f"  → {msg}")
+
+def show_menu(title, options):
+    """Show a numbered menu, return chosen key."""
+    if RICH:
+        console.print(f"  [bold]{title}[/bold]\n")
+        for key, label in options:
+            console.print(f"  [cyan]{key}[/cyan])  {label}")
+    else:
+        print(f"  {title}\n")
+        for key, label in options:
+            print(f"  {key})  {label}")
+    print()
+    choice = input("  Enter choice: ").strip().lower()
+    return choice
+
+# ── Archive table display ─────────────────────────────────────────────────────
+
+def show_archives_table(archives, title="Archives"):
+    if not archives:
+        warn("No archives found.")
+        return
+
+    if RICH:
+        t = Table(title=title, box=box.SIMPLE_HEAVY, show_lines=False)
+        t.add_column("ID",       style="cyan",  no_wrap=True)
+        t.add_column("Name",     style="white", max_width=28)
+        t.add_column("Lab/PI",   style="dim",   max_width=20)
+        t.add_column("Tape",     style="yellow",no_wrap=True)
+        t.add_column("Size",     style="green", justify="right")
+        t.add_column("Date",     style="dim",   no_wrap=True)
+        t.add_column("Status",   no_wrap=True)
+
+        status_colors = {
+            "archived": "white",
+            "verified": "green",
+            "restored": "blue",
+            "corrupt":  "red",
+            "dry_run":  "dim",
+        }
+
+        for a in archives:
+            lab_pi = "/".join(filter(None, [a.lab, a.pi])) or "—"
+            date = a.date_archived[:10] if a.date_archived else "—"
+            color = status_colors.get(a.status, "white")
+            t.add_row(
+                a.archive_id, a.name, lab_pi, a.tape_label,
+                core.human_size(a.size_bytes),
+                date,
+                f"[{color}]{a.status}[/{color}]"
+            )
+        console.print(t)
+    else:
+        fmt = "{:<12} {:<28} {:<18} {:<14} {:<10} {:<12} {:<10}"
+        print(fmt.format("ID","Name","Lab/PI","Tape","Size","Date","Status"))
+        print("-" * 108)
+        for a in archives:
+            lab_pi = "/".join(filter(None, [a.lab, a.pi])) or "—"
+            date = a.date_archived[:10] if a.date_archived else "—"
+            print(fmt.format(
+                a.archive_id, a.name[:27], lab_pi[:17], a.tape_label,
+                core.human_size(a.size_bytes), date, a.status
+            ))
+
+def show_tapes_table(tapes, title="Tape Inventory"):
+    if not tapes:
+        warn("No tapes registered.")
+        return
+
+    if RICH:
+        t = Table(title=title, box=box.SIMPLE_HEAVY)
+        t.add_column("Label",     style="cyan")
+        t.add_column("Archives",  justify="right")
+        t.add_column("Total Data",justify="right", style="green")
+        t.add_column("First Used",style="dim")
+        t.add_column("Last Verified", style="dim")
+        t.add_column("Notes",     style="dim", max_width=30)
+        for tp in tapes:
+            lv = tp.last_verified[:10] if tp.last_verified else "[yellow]Never[/yellow]"
+            t.add_row(
+                tp.label,
+                str(tp.total_archives),
+                core.human_size(tp.total_bytes),
+                tp.date_first_used[:10] if tp.date_first_used else "—",
+                lv,
+                tp.notes or "—"
+            )
+        console.print(t)
+    else:
+        fmt = "{:<16} {:<10} {:<12} {:<12} {:<14} {}"
+        print(fmt.format("Label","Archives","Total Data","First Used","Last Verified","Notes"))
+        print("-" * 90)
+        for tp in tapes:
+            lv = tp.last_verified[:10] if tp.last_verified else "Never"
+            print(fmt.format(
+                tp.label, tp.total_archives,
+                core.human_size(tp.total_bytes),
+                tp.date_first_used[:10] if tp.date_first_used else "—",
+                lv, tp.notes or "—"
+            ))
+
+# ── Tape Management ───────────────────────────────────────────────────────────
+
+def do_tape_management():
+    while True:
+        header("Tape Management")
+        status_line()
+        choice = show_menu("Tape Operations", [
+            ("1", "Mount tape"),
+            ("2", "Unmount & eject tape"),
+            ("3", "Format a NEW tape (destructive)"),
+            ("4", "Show drive status"),
+            ("5", "Register tape in database"),
+            ("b", "Back"),
+        ])
+
+        if choice == "1":
+            _mount_tape()
+        elif choice == "2":
+            _unmount_tape()
+        elif choice == "3":
+            _format_tape()
+        elif choice == "4":
+            _drive_status()
+        elif choice == "5":
+            _register_tape()
+        elif choice == "b":
+            break
+
+def _mount_tape():
+    header("Mount Tape")
+    if core.is_mounted(MOUNT):
+        warn("A tape is already mounted.")
+        pause()
+        return
+    info("Make sure the tape is loaded in the drive.")
+    if not confirm("Proceed with mount?"):
+        return
+    try:
+        core.mount_tape(SG, MOUNT, progress_cb=progress_msg)
+        info(f"Tape mounted at {MOUNT}")
+    except core.TapeError as e:
+        error(str(e))
+    pause()
+
+def _unmount_tape():
+    header("Unmount & Eject Tape")
+    if not core.is_mounted(MOUNT):
+        warn("No tape is currently mounted.")
+        if confirm("Eject tape anyway?", default=False):
+            core.eject_tape(ST)
+            info("Tape ejected.")
+        pause()
+        return
+
+    # Check cleaning while tape is still accessible
+    info("Checking drive status...")
+    needs_clean, clean_msg = core.cleaning_status_str(SG, ST)
+
+    # Offer verify before unmount
+    try:
+        tapes = core.list_tapes(DB)
+        if tapes:
+            if confirm("Verify datasets on this tape before ejecting?", default=False):
+                tape_label = prompt("Enter tape label to verify")
+                if tape_label:
+                    results = core.verify_tape_datasets(
+                        tape_label, DB, MOUNT, ALGO, progress_cb=progress_msg
+                    )
+                    for aid, ok in results.items():
+                        if ok:
+                            info("{}: verified".format(aid))
+                        else:
+                            error("{}: FAILED".format(aid))
+    except Exception:
+        pass
+
+    try:
+        core.unmount_tape(MOUNT, progress_cb=progress_msg)
+        info("Tape unmounted.")
+        if confirm("Eject the tape?", default=True):
+            core.eject_tape(ST)
+            info("Tape ejected. Safe to remove.")
+    except core.TapeError as e:
+        error(str(e))
+        pause()
+        return
+
+    # Show cleaning warning after eject
+    if needs_clean:
+        print()
+        if RICH:
+            console.print("  [bold red]⚠  DRIVE NEEDS CLEANING[/bold red]")
+            console.print("  [yellow]  Reason: {}[/yellow]".format(clean_msg))
+            console.print("  [dim]  Load a cleaning cartridge before the next archive job.[/dim]")
+        else:
+            print("  *** DRIVE NEEDS CLEANING ***")
+            print("  Reason: {}".format(clean_msg))
+            print("  Load a cleaning cartridge before next use.")
+        if confirm("Log this cleaning reminder?", default=True):
+            core.log_cleaning_event(DB, SG, action="cleaning_needed", notes=clean_msg)
+            info("Logged to maintenance log.")
+
+    pause()
+
+def _format_tape():
+    header("Format New Tape")
+    if core.is_mounted(MOUNT):
+        error("A tape is currently mounted. Unmount it first.")
+        pause()
+        return
+
+    if RICH:
+        console.print("  [red bold]WARNING: This will ERASE ALL DATA on the tape.[/red bold]\n")
+    else:
+        print("  WARNING: This will ERASE ALL DATA on the tape.\n")
+
+    label = prompt("Enter tape label (e.g. CRYO-2025-A)").upper().replace(" ", "")
+    if not label:
+        warn("Label cannot be empty.")
+        pause()
+        return
+
+    confirm_str = input(f"\n  Type YES to confirm formatting tape '{label}': ").strip()
+    if confirm_str != "YES":
+        warn("Format cancelled.")
+        pause()
+        return
+
+    info("Waiting for tape to be ready...")
+    info("NOTE: New tapes may take 15-30 minutes to initialize before formatting.")
+    print()
+
+    try:
+        core.format_tape(SG, label, progress_cb=progress_msg)
+        info(f"Tape '{label}' formatted successfully.")
+        core.add_tape(DB, label)
+        info(f"Tape '{label}' registered in database.")
+        if confirm("Mount the tape now?"):
+            core.mount_tape(SG, MOUNT, progress_cb=progress_msg)
+            info(f"Tape mounted at {MOUNT}")
+    except core.TapeError as e:
+        error(str(e))
+    pause()
+
+def _drive_status():
+    header("Drive Status")
+    status = core.tape_status(ST)
+    if RICH:
+        console.print(Panel(status, title="mt status", border_style="dim"))
+    else:
+        print(status)
+
+    if core.is_mounted(MOUNT):
+        total = core.tape_total_bytes(MOUNT)
+        free = core.tape_free_bytes(MOUNT)
+        used = total - free
+        info(f"Mounted: {MOUNT}")
+        info(f"Total:   {core.human_size(total)}")
+        info(f"Used:    {core.human_size(used)}")
+        info(f"Free:    {core.human_size(free)}")
+    pause()
+
+def _register_tape():
+    header("Register Tape")
+    label = prompt("Tape label").upper().replace(" ", "")
+    if not label:
+        return
+    notes = prompt("Notes (optional)", default="")
+    core.add_tape(DB, label, notes)
+    info(f"Tape '{label}' registered.")
+    pause()
+
+# ── Archive ───────────────────────────────────────────────────────────────────
+
+def do_archive():
+    header("Archive Dataset")
+
+    if not core.is_mounted(MOUNT):
+        error("No tape mounted. Mount a tape first (Tape Management → Mount).")
+        pause()
+        return
+
+    print()
+    info("Tape mounted. Free space: {}".format(core.human_size(core.tape_free_bytes(MOUNT))))
+    print()
+
+    source_path = prompt("Source path to archive (full path)").strip()
+    if not source_path or not os.path.exists(source_path):
+        error("Path does not exist: {}".format(source_path))
+        pause()
+        return
+
+    src_size, src_count = core.dir_size_and_count(source_path)
+    info("Source: {} in {} files".format(core.human_size(src_size), src_count))
+    print()
+
+    name       = prompt("Dataset name (human readable)")
+    lab        = prompt("Lab name (optional)", default="")
+    pi         = prompt("PI name (optional)", default="")
+    notes      = prompt("Notes (optional)", default="")
+    tape_label = prompt("Which tape is loaded? (label)")
+    if not tape_label:
+        error("Tape label required.")
+        pause()
+        return
+    tape_label = tape_label.upper().replace(" ", "")
+    use_tar    = confirm(
+        "Bundle as tar archive? (recommended for many small files)", default=TAR_DEF
+    )
+
+    print()
+
+    # Preflight
+    errors = core.preflight_check(source_path, STAGING, MOUNT, MIN_STG)
+    if errors:
+        if RICH:
+            console.print("  [red bold]Preflight checks failed:[/red bold]")
+        else:
+            print("  Preflight checks failed:")
+        for e in errors:
+            error(e)
+        if not confirm("Proceed anyway?", default=False):
+            pause()
+            return
+
+    # Optional dry run
+    if confirm("Run a dry run first (no data written)?", default=False):
+        rec = core.archive_dataset(
+            source_path=source_path, name=name, tape_label=tape_label,
+            db_path=DB, staging_dir=STAGING, mount_point=MOUNT,
+            checksum_algo=ALGO, use_tar=use_tar,
+            lab=lab, pi=pi, notes=notes,
+            progress_cb=progress_msg, dry_run=True
+        )
+        info("Dry run complete — would create {}".format(rec.archive_id))
+        if not confirm("Proceed with actual archive?", default=True):
+            pause()
+            return
+
+    # Submit background job
+    print()
+    job = core.submit_archive_job(
+        state_dir=STATE_DIR, db_path=DB,
+        source_path=source_path, name=name, tape_label=tape_label,
+        staging_dir=STAGING, mount_point=MOUNT,
+        checksum_algo=ALGO, use_tar=use_tar,
+        lab=lab, pi=pi, notes=notes,
+        cfg=cfg, sg_device=SG, st_device=ST,
+    )
+    print()
+    if RICH:
+        from rich.panel import Panel
+        console.print(Panel(
+            "[green bold]Archive job submitted![/green bold]\n\n"
+            "  Job ID:   [cyan]{}[/cyan]\n"
+            "  Dataset:  {}\n"
+            "  Tape:     {}\n"
+            "  Source:   {}\n\n"
+            "[dim]Running in background — safe to close tapeman2.\n"
+            "Check progress in the Jobs menu (option 6).[/dim]".format(
+                job["job_id"], name, tape_label, source_path),
+            title="Job Submitted", border_style="green"
+        ))
+    else:
+        print("  Archive job submitted: {}".format(job["job_id"]))
+        print("  Running in background — check Jobs menu (option 6) for status.")
+    pause()
+
+# ── Restore ───────────────────────────────────────────────────────────────────
+
+def do_restore():
+    header("Restore Dataset")
+
+    archives = core.list_archives(DB)
+    if not archives:
+        warn("No archives in database.")
+        pause()
+        return
+
+    show_archives_table(archives, "Available Archives")
+    print()
+
+    archive_id = prompt("Enter Archive ID to restore (e.g. ARCH-0001)").upper().strip()
+    if not archive_id:
+        return
+
+    rec = core.get_archive(DB, archive_id)
+    if not rec:
+        error("Archive ID '{}' not found.".format(archive_id))
+        pause()
+        return
+
+    if RICH:
+        from rich.panel import Panel
+        console.print(Panel(
+            "  Name:    {}\n  Tape:    [yellow]{}[/yellow]\n"
+            "  Size:    {}\n  Date:    {}\n  Source:  {}".format(
+                rec.name, rec.tape_label, core.human_size(rec.size_bytes),
+                rec.date_archived, rec.source_path),
+            title="Archive {}".format(archive_id), border_style="cyan"
+        ))
+    else:
+        print("\n  Archive: {}  Name: {}  Tape: {}".format(
+            archive_id, rec.name, rec.tape_label))
+
+    print()
+    if RICH:
+        console.print("  [yellow]Please load tape: [bold]{}[/bold][/yellow]".format(
+            rec.tape_label))
+    else:
+        print("  Please load tape: {}".format(rec.tape_label))
+    print()
+
+    if not core.is_mounted(MOUNT):
+        if confirm("Tape not mounted. Mount it now?"):
+            try:
+                core.mount_tape(SG, MOUNT, progress_cb=progress_msg)
+            except core.TapeError as e:
+                error(str(e))
+                pause()
+                return
+        else:
+            pause()
+            return
+
+    dest = prompt("Restore destination path", default=RESTORE).strip()
+    if not dest:
+        error("Destination required.")
+        pause()
+        return
+
+    print()
+    job = core.submit_restore_job(
+        state_dir=STATE_DIR, db_path=DB,
+        archive_id=archive_id, dest_path=dest,
+        mount_point=MOUNT, checksum_algo=ALGO,
+        cfg=cfg, sg_device=SG, st_device=ST,
+    )
+    if RICH:
+        from rich.panel import Panel
+        console.print(Panel(
+            "[green bold]Restore job submitted![/green bold]\n\n"
+            "  Job ID:      [cyan]{}[/cyan]\n"
+            "  Archive:     {}\n"
+            "  Destination: {}\n\n"
+            "[dim]Running in background — check Jobs menu (option 6).[/dim]".format(
+                job["job_id"], archive_id, dest),
+            title="Job Submitted", border_style="green"
+        ))
+    else:
+        print("  Restore job submitted: {}".format(job["job_id"]))
+    pause()
+
+# ── Verify ────────────────────────────────────────────────────────────────────
+
+def do_verify():
+    header("Verify Archive")
+
+    if not core.is_mounted(MOUNT):
+        error("No tape mounted.")
+        pause()
+        return
+
+    choice = show_menu("Verify", [
+        ("1", "Verify a single archive by ID (background)"),
+        ("2", "Verify all archives on current tape (background)"),
+        ("b", "Back"),
+    ])
+
+    if choice == "1":
+        archive_id = prompt("Archive ID").upper().strip()
+        if archive_id:
+            job = core.submit_verify_job(
+                state_dir=STATE_DIR, db_path=DB,
+                archive_id=archive_id,
+                mount_point=MOUNT, checksum_algo=ALGO,
+            )
+            info("Verify job submitted: {} — check Jobs menu (option 6).".format(
+                job["job_id"]))
+    elif choice == "2":
+        tape_label = prompt("Tape label")
+        if tape_label:
+            archives = core.list_archives(DB, tape_label=tape_label.upper())
+            for a in archives:
+                job = core.submit_verify_job(
+                    state_dir=STATE_DIR, db_path=DB,
+                    archive_id=a.archive_id,
+                    mount_point=MOUNT, checksum_algo=ALGO,
+                )
+                info("Submitted {} for {}".format(job["job_id"], a.archive_id))
+            if archives:
+                info("All verify jobs submitted — check Jobs menu (option 6).")
+            else:
+                warn("No archives found for that tape.")
+    pause()
+
+# ── Jobs ──────────────────────────────────────────────────────────────────────
+
+def _job_status_color(status):
+    return {"running":"cyan","complete":"green","failed":"red",
+            "cancelled":"dim","queued":"yellow"}.get(status,"white")
+
+def show_jobs_table(jobs, title="Jobs"):
+    if not jobs:
+        warn("No jobs found.")
+        return
+    if RICH:
+        from rich.table import Table
+        from rich import box as rbox
+        t = Table(title=title, box=rbox.SIMPLE_HEAVY)
+        t.add_column("Job ID",  style="cyan", no_wrap=True)
+        t.add_column("Type",    style="dim",  no_wrap=True)
+        t.add_column("Dataset/Archive", max_width=24)
+        t.add_column("Status",  no_wrap=True)
+        t.add_column("Progress", max_width=36)
+        t.add_column("Started", style="dim", no_wrap=True)
+        t.add_column("Finished",style="dim", no_wrap=True)
+        for j in jobs:
+            c = _job_status_color(j.get("status",""))
+            dataset  = j.get("name") or j.get("archive_id") or "—"
+            finished = (j.get("finished") or "")[:16] or "—"
+            t.add_row(
+                j.get("job_id",""), j.get("type",""), dataset,
+                "[{}]{}[/{}]".format(c, j.get("status",""), c),
+                j.get("progress",""),
+                (j.get("started") or "")[:16], finished,
+            )
+        console.print(t)
+    else:
+        fmt = "{:<10} {:<10} {:<20} {:<12} {:<32} {:<17} {}"
+        print(fmt.format("Job ID","Type","Dataset","Status","Progress","Started","Finished"))
+        print("-"*110)
+        for j in jobs:
+            dataset  = (j.get("name") or j.get("archive_id") or "—")[:19]
+            finished = (j.get("finished") or "")[:16] or "—"
+            print(fmt.format(
+                j.get("job_id",""), j.get("type",""), dataset,
+                j.get("status",""), (j.get("progress","") or "")[:31],
+                (j.get("started") or "")[:16], finished,
+            ))
+
+def do_jobs():
+    while True:
+        header("Jobs")
+        jobs = core.list_jobs(STATE_DIR)
+        show_jobs_table(jobs)
+        print()
+        choice = show_menu("Jobs", [
+            ("1", "Refresh"),
+            ("2", "Running jobs only"),
+            ("3", "Completed jobs"),
+            ("4", "Failed jobs"),
+            ("5", "Cancel a running job"),
+            ("6", "Clean up old completed jobs"),
+            ("b", "Back"),
+        ])
+        if choice == "1":
+            continue
+        elif choice == "2":
+            header("Running Jobs")
+            show_jobs_table(core.list_jobs(STATE_DIR, status=core.JOB_STATUS_RUNNING))
+            pause()
+        elif choice == "3":
+            header("Completed Jobs")
+            show_jobs_table(core.list_jobs(STATE_DIR, status=core.JOB_STATUS_COMPLETE))
+            pause()
+        elif choice == "4":
+            header("Failed Jobs")
+            jobs = core.list_jobs(STATE_DIR, status=core.JOB_STATUS_FAILED)
+            show_jobs_table(jobs, "Failed")
+            for j in jobs:
+                if j.get("error"):
+                    error("{}: {}".format(j["job_id"], j["error"]))
+            pause()
+        elif choice == "5":
+            job_id = prompt("Job ID to cancel").upper().strip()
+            if job_id:
+                if core.cancel_job(STATE_DIR, job_id):
+                    info("Job {} cancelled.".format(job_id))
+                else:
+                    error("Could not cancel {} — not running or not found.".format(job_id))
+            pause()
+        elif choice == "6":
+            removed = core.cleanup_jobs(STATE_DIR, keep_days=7)
+            info("Removed {} job file{}.".format(removed, "s" if removed != 1 else ""))
+            pause()
+        elif choice == "b":
+            break
+
+# ── Inventory ─────────────────────────────────────────────────────────────────
+
+def do_inventory():
+    while True:
+        header("Archive Inventory")
+        choice = show_menu("Inventory", [
+            ("1", "List all archives"),
+            ("2", "Search archives"),
+            ("3", "View archives by tape"),
+            ("4", "View archives by lab"),
+            ("5", "Tape inventory"),
+            ("6", "Which tape has archive ID?"),
+            ("7", "Export to CSV"),
+            ("8", "Maintenance log"),
+            ("b", "Back"),
+        ])
+
+        if choice == "1":
+            header("All Archives")
+            archives = core.list_archives(DB)
+            show_archives_table(archives)
+            pause()
+
+        elif choice == "2":
+            header("Search Archives")
+            term = prompt("Search term (name, lab, PI, notes, ID)")
+            archives = core.list_archives(DB, search=term)
+            show_archives_table(archives, f"Search: '{term}'")
+            pause()
+
+        elif choice == "3":
+            header("Archives by Tape")
+            label = prompt("Tape label").upper().strip()
+            archives = core.list_archives(DB, tape_label=label)
+            show_archives_table(archives, f"Tape: {label}")
+            pause()
+
+        elif choice == "4":
+            header("Archives by Lab")
+            lab = prompt("Lab name")
+            archives = core.list_archives(DB, lab=lab)
+            show_archives_table(archives, f"Lab: {lab}")
+            pause()
+
+        elif choice == "5":
+            header("Tape Inventory")
+            tapes = core.list_tapes(DB)
+            show_tapes_table(tapes)
+            pause()
+
+        elif choice == "6":
+            header("Tape Lookup")
+            archive_id = prompt("Archive ID").upper().strip()
+            tape = core.which_tape(DB, archive_id)
+            if tape:
+                if RICH:
+                    console.print(f"\n  Archive [cyan]{archive_id}[/cyan] is on tape "
+                                  f"[yellow bold]{tape}[/yellow bold]")
+                else:
+                    print(f"\n  {archive_id} is on tape: {tape}")
+            else:
+                error(f"Archive ID '{archive_id}' not found.")
+            pause()
+
+        elif choice == "7":
+            header("Export to CSV")
+            out = prompt("Output file path", default="/tmp/tapeman2_export.csv")
+            label = prompt("Filter by tape label (leave blank for all)", default="")
+            core.export_csv(DB, out, tape_label=label or None)
+            info("Exported to {}".format(out))
+            pause()
+
+        elif choice == "8":
+            header("Maintenance Log")
+            rows = core.get_maintenance_log(DB)
+            if not rows:
+                warn("No maintenance events logged yet.")
+            else:
+                if RICH:
+                    from rich.table import Table
+                    from rich import box as rbox
+                    t = Table(box=rbox.SIMPLE_HEAVY)
+                    t.add_column("Time",   style="dim")
+                    t.add_column("Device", style="cyan")
+                    t.add_column("Action", style="yellow")
+                    t.add_column("Notes")
+                    for r in rows:
+                        t.add_row(
+                            (r.get("timestamp") or "")[:16],
+                            r.get("device") or "",
+                            r.get("action") or "",
+                            r.get("notes") or "",
+                        )
+                    console.print(t)
+                else:
+                    fmt = "{:<17} {:<10} {:<20} {}"
+                    print(fmt.format("Time", "Device", "Action", "Notes"))
+                    print("-" * 70)
+                    for r in rows:
+                        print(fmt.format(
+                            (r.get("timestamp") or "")[:16],
+                            r.get("device") or "",
+                            r.get("action") or "",
+                            r.get("notes") or "",
+                        ))
+            pause()
+
+        elif choice == "b":
+            break
+
+# ── Library / Changer ─────────────────────────────────────────────────────────
+
+def do_library():
+    if not core.changer_enabled(cfg):
+        header("Library / Changer")
+        warn("Changer support is disabled.")
+        info("To enable, set 'enabled = true' in /etc/tapeman2/tapeman2.conf [changer]")
+        info("Also ensure 'mtx' is installed: dnf install mtx")
+        pause()
+        return
+
+    changer_dev = core.get_changer_device(cfg)
+
+    while True:
+        header("Library / Changer  [{}]".format(changer_dev))
+
+        # Show quick slot summary if we can
+        try:
+            status = core.library_status_with_db(changer_dev, DB)
+            total = len(status.slots)
+            occupied = sum(1 for s in status.slots if s.occupied)
+            drives_loaded = sum(1 for d in status.drives if d.occupied)
+            if RICH:
+                console.print("  Slots: [green]{}/{}[/green] occupied  "
+                              "Drives: [cyan]{}/{}[/cyan] loaded\n".format(
+                                  occupied, total,
+                                  drives_loaded, len(status.drives)))
+            else:
+                print("  Slots: {}/{} occupied  Drives: {}/{} loaded\n".format(
+                    occupied, total, drives_loaded, len(status.drives)))
+        except Exception as e:
+            warn("Could not read library status: {}".format(e))
+
+        choice = show_menu("Library Operations", [
+            ("1", "Show library slot map"),
+            ("2", "Find & load tape by label"),
+            ("3", "Load slot into drive"),
+            ("4", "Unload drive to home slot"),
+            ("5", "Run inventory scan (re-read barcodes)"),
+            ("6", "Show changer operation log"),
+            ("b", "Back"),
+        ])
+
+        if choice == "1":
+            _show_slot_map(changer_dev)
+        elif choice == "2":
+            _find_and_load(changer_dev)
+        elif choice == "3":
+            _manual_load(changer_dev)
+        elif choice == "4":
+            _manual_unload(changer_dev)
+        elif choice == "5":
+            _inventory_scan(changer_dev)
+        elif choice == "6":
+            _show_changer_log()
+        elif choice == "b":
+            break
+
+def _show_slot_map(changer_dev):
+    header("Library Slot Map")
+    try:
+        status = core.library_status_with_db(changer_dev, DB)
+    except Exception as e:
+        error("Failed to read library: {}".format(e))
+        pause()
+        return
+
+    def slot_line(s):
+        occupied_str = s.barcode or s.label or "(empty)"
+        type_str = {"drive": "DRIVE", "storage": "SLOT ", "ie": "I/E  "}.get(
+            s.slot_type, "?    ")
+        if RICH:
+            color = "green" if s.occupied else "dim"
+            loaded = " [cyan]*LOADED*[/cyan]" if s.slot_type == "drive" and s.occupied else ""
+            console.print("  [{}]{} {:3d}[/{}]  {}{}".format(
+                color, type_str, s.slot_num, color, occupied_str, loaded))
+        else:
+            loaded = " *LOADED*" if s.slot_type == "drive" and s.occupied else ""
+            print("  {} {:3d}  {}{}".format(type_str, s.slot_num, occupied_str, loaded))
+
+    if status.drives:
+        if RICH:
+            console.print("  [bold cyan]── Drives ──[/bold cyan]")
+        else:
+            print("  ── Drives ──")
+        for d in status.drives:
+            slot_line(d)
+
+    if status.ie_slots:
+        if RICH:
+            console.print("\n  [bold cyan]── Import/Export ──[/bold cyan]")
+        else:
+            print("\n  ── Import/Export ──")
+        for s in status.ie_slots:
+            slot_line(s)
+
+    if RICH:
+        console.print("\n  [bold cyan]── Storage Slots ──[/bold cyan]")
+    else:
+        print("\n  ── Storage Slots ──")
+    for s in status.slots:
+        slot_line(s)
+
+    pause()
+
+def _find_and_load(changer_dev):
+    header("Find & Load Tape")
+    label = prompt("Tape label to load").upper().strip()
+    if not label:
+        return
+    drive = prompt("Drive number", default="0")
+    try:
+        drive = int(drive)
+    except ValueError:
+        drive = 0
+    try:
+        slot = core.changer_load(changer_dev, label, drive, DB, progress_cb=progress_msg)
+        info("Tape '{}' loaded from slot {} into drive {}.".format(label, slot, drive))
+    except Exception as e:
+        error(str(e))
+    pause()
+
+def _manual_load(changer_dev):
+    header("Load Slot into Drive")
+    slot = prompt("Slot number")
+    drive = prompt("Drive number", default="0")
+    try:
+        slot, drive = int(slot), int(drive)
+    except ValueError:
+        error("Invalid slot or drive number.")
+        pause()
+        return
+    try:
+        ch = core._get_changer()
+        ch.load_tape(changer_dev, slot, drive, progress_cb=progress_msg)
+        core._log_changer_op(DB, "load", slot, drive, "", "ok")
+        info("Loaded slot {} into drive {}.".format(slot, drive))
+    except Exception as e:
+        error(str(e))
+    pause()
+
+def _manual_unload(changer_dev):
+    header("Unload Drive to Home Slot")
+    drive = prompt("Drive number", default="0")
+    try:
+        drive = int(drive)
+    except ValueError:
+        drive = 0
+    try:
+        slot = core.changer_unload(changer_dev, drive, DB, progress_cb=progress_msg)
+        if slot is not None:
+            info("Drive {} unloaded to slot {}.".format(drive, slot))
+        else:
+            warn("Drive {} was already empty.".format(drive))
+    except Exception as e:
+        error(str(e))
+    pause()
+
+def _inventory_scan(changer_dev):
+    header("Inventory Scan")
+    info("Scanning library barcodes — this may take a moment...")
+    try:
+        core.changer_inventory_scan(changer_dev, DB, progress_cb=progress_msg)
+        info("Inventory scan complete.")
+    except Exception as e:
+        error(str(e))
+    pause()
+
+def _show_changer_log():
+    header("Changer Operation Log")
+    rows = core.get_changer_log(DB, limit=50)
+    if not rows:
+        warn("No changer operations logged yet.")
+        pause()
+        return
+    if RICH:
+        from rich.table import Table
+        from rich import box
+        t = Table(box=box.SIMPLE_HEAVY)
+        t.add_column("Time",  style="dim", no_wrap=True)
+        t.add_column("Op",    style="cyan")
+        t.add_column("Slot",  justify="right")
+        t.add_column("Drive", justify="right")
+        t.add_column("Tape",  style="yellow")
+        t.add_column("Result")
+        for r in rows:
+            t.add_row(
+                (r["timestamp"] or "")[:16],
+                r["operation"] or "",
+                str(r["slot"] or ""),
+                str(r["drive"] or ""),
+                r["tape_label"] or "",
+                r["result"] or "",
+            )
+        console.print(t)
+    else:
+        fmt = "{:<17} {:<10} {:<6} {:<6} {:<16} {}"
+        print(fmt.format("Time","Op","Slot","Drive","Tape","Result"))
+        print("-"*70)
+        for r in rows:
+            print(fmt.format(
+                (r["timestamp"] or "")[:16],
+                r["operation"] or "",
+                str(r["slot"] or ""),
+                str(r["drive"] or ""),
+                r["tape_label"] or "",
+                r["result"] or "",
+            ))
+    pause()
+
+# ── Main Menu ─────────────────────────────────────────────────────────────────
+
+def _check_permissions():
+    """
+    Check that the tape device is accessible.
+    With world-accessible devices (mode 0666) any user can run tapeman2.
+    Falls back to checking tape group membership for stricter setups.
+    """
+    import grp
+    if os.geteuid() == 0:
+        return  # root always OK
+
+    sg = cfg.get("device", "sg_device", fallback="/dev/sg0")
+
+    # Check direct device access first (works if device is 0666)
+    if os.access(sg, os.R_OK | os.W_OK):
+        return
+
+    # Fall back: check tape group membership
+    try:
+        tape_gid = grp.getgrnam("tape").gr_gid
+        if tape_gid in os.getgroups():
+            return
+    except KeyError:
+        pass
+
+    # Permission denied — give helpful message
+    if RICH:
+        console.print(
+            "\n  [red bold]Permission denied.[/red bold]\n\n"
+            "  Cannot access tape device: [cyan]{}[/cyan]\n\n"
+            "  Ask your administrator to run:\n"
+            "    [dim]sudo chmod 666 {}[/dim]\n"
+            "  or add you to the tape group:\n"
+            "    [dim]sudo usermod -aG tape {}[/dim]\n"
+            "  (then log out and back in)".format(
+                sg, sg, os.environ.get("USER", "your-username"))
+        )
+    else:
+        print("\n  Permission denied: cannot access {}".format(sg))
+        print("  Ask your admin: sudo chmod 666 {}".format(sg))
+    sys.exit(1)
+
+
+def main():
+    _check_permissions()
+
+    while True:
+        header()
+        status_line()
+
+        choice = show_menu("Main Menu", [
+            ("1", "Archive a dataset"),
+            ("2", "Restore a dataset"),
+            ("3", "Verify archives"),
+            ("4", "Browse inventory & search"),
+            ("5", "Tape management (mount / unmount / format)"),
+            ("6", "Jobs (background archive/restore/verify)"),
+            ("7", "Library / changer management"),
+            ("q", "Quit"),
+        ])
+
+        if choice == "1":
+            do_archive()
+        elif choice == "2":
+            do_restore()
+        elif choice == "3":
+            do_verify()
+        elif choice == "4":
+            do_inventory()
+        elif choice == "5":
+            do_tape_management()
+        elif choice == "6":
+            do_jobs()
+        elif choice == "7":
+            do_library()
+        elif choice in ("q", "quit", "exit"):
+            if RICH:
+                console.print("\n  [dim]Goodbye.[/dim]\n")
+            else:
+                print("\n  Goodbye.\n")
+            sys.exit(0)
+
+if __name__ == "__main__":
+    main()

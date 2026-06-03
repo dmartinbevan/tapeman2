@@ -1,0 +1,626 @@
+#!/usr/bin/env python3
+"""
+tapeman2-setup — Interactive configuration wizard for tapeman2
+Configures single drive or multi-drive library setups.
+Run as root.
+"""
+
+import os
+import sys
+import subprocess
+import configparser
+from pathlib import Path
+
+CONFIG_PATH = "/etc/tapeman2/tapeman2.conf"
+
+# ── Try rich ──────────────────────────────────────────────────────────────────
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.prompt import Prompt, Confirm
+    from rich.table import Table
+    from rich import box
+    RICH = True
+    console = Console()
+except ImportError:
+    RICH = False
+    class _Con:
+        def print(self, *a, **k):
+            import re
+            print(re.sub(r"\[.*?\]", "", " ".join(str(x) for x in a)))
+        def rule(self, t=""):
+            print("\n" + ("─"*60) + ("  " + t if t else "") + "\n")
+    console = _Con()
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def clear():
+    os.system("clear")
+
+def header(sub=""):
+    clear()
+    if RICH:
+        console.print(Panel.fit(
+            "[bold cyan]TapeMan 2[/bold cyan]  [dim]Configuration Wizard[/dim]"
+            + ("\n[dim]{}[/dim]".format(sub) if sub else ""),
+            border_style="cyan"
+        ))
+    else:
+        print("=" * 60)
+        print("  TapeMan 2 — Configuration Wizard")
+        if sub:
+            print("  " + sub)
+        print("=" * 60)
+    print()
+
+def info(msg):
+    if RICH:
+        console.print("  [green]✔[/green]  " + msg)
+    else:
+        print("  ✔  " + msg)
+
+def warn(msg):
+    if RICH:
+        console.print("  [yellow]⚠[/yellow]  " + msg)
+    else:
+        print("  ⚠  " + msg)
+
+def error(msg):
+    if RICH:
+        console.print("  [red]✘[/red]  " + msg)
+    else:
+        print("  ✘  " + msg)
+
+def prompt(msg, default=""):
+    if RICH:
+        return Prompt.ask("  [cyan]{}[/cyan]".format(msg), default=default)
+    else:
+        d = " [{}]".format(default) if default else ""
+        val = input("  {}{}: ".format(msg, d)).strip()
+        return val if val else default
+
+def confirm(msg, default=True):
+    if RICH:
+        return Confirm.ask("  [cyan]{}[/cyan]".format(msg), default=default)
+    else:
+        d = "Y/n" if default else "y/N"
+        val = input("  {} [{}]: ".format(msg, d)).strip().lower()
+        if not val:
+            return default
+        return val.startswith("y")
+
+def pause():
+    input("\n  Press Enter to continue...")
+
+def run(cmd):
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True)
+    return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+# ── Device Detection ──────────────────────────────────────────────────────────
+
+def detect_tape_drives():
+    """Return list of (sg_device, st_device, model) for tape drives."""
+    out, _, _ = run(["lsscsi", "-g"])
+    drives = []
+    st_idx = 0
+    for line in out.splitlines():
+        if "tape" in line.lower():
+            parts = line.split()
+            # Find sg device (last field) and model
+            sg = next((p for p in parts if p.startswith("/dev/sg")), "")
+            model = " ".join(parts[2:5]) if len(parts) >= 5 else "Unknown"
+            st = "/dev/st{}".format(st_idx)
+            nst = "/dev/nst{}".format(st_idx)
+            drives.append({
+                "sg": sg, "st": st, "nst": nst,
+                "model": model, "index": st_idx
+            })
+            st_idx += 1
+    return drives
+
+def detect_changers():
+    """Return list of (sg_device, model) for media changers."""
+    out, _, _ = run(["lsscsi", "-g"])
+    changers = []
+    for line in out.splitlines():
+        if "mediumx" in line.lower() or "changer" in line.lower():
+            parts = line.split()
+            sg = next((p for p in parts if p.startswith("/dev/sg")), "")
+            model = " ".join(parts[2:5]) if len(parts) >= 5 else "Unknown"
+            changers.append({"sg": sg, "model": model})
+    return changers
+
+def check_mtx():
+    _, _, rc = run(["which", "mtx"])
+    return rc == 0
+
+def check_ltfs():
+    _, _, rc = run(["which", "ltfs"])
+    return rc == 0
+
+def check_mkltfs():
+    _, _, rc = run(["which", "mkltfs"])
+    return rc == 0
+
+# ── Config Read/Write ─────────────────────────────────────────────────────────
+
+def load_config():
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG_PATH)
+    return cfg
+
+def save_config(cfg):
+    Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        cfg.write(f)
+
+def ensure_sections(cfg):
+    for section in ["device", "paths", "archive", "changer", "ui"]:
+        if not cfg.has_section(section):
+            cfg.add_section(section)
+
+# ── Wizard Steps ──────────────────────────────────────────────────────────────
+
+def step_welcome():
+    header()
+    if RICH:
+        console.print(
+            "  This wizard will configure [bold cyan]tapeman2[/bold cyan] for your system.\n\n"
+            "  It will:\n"
+            "  • Detect your tape drive(s) and changer\n"
+            "  • Configure single-drive or library mode\n"
+            "  • Set up staging and restore paths\n"
+            "  • Write [dim]/etc/tapeman2/tapeman2.conf[/dim]\n"
+        )
+    else:
+        print("  This wizard configures tapeman2.\n")
+        print("  It will detect drives, configure library mode if needed,")
+        print("  and write /etc/tapeman2/tapeman2.conf\n")
+
+    if Path(CONFIG_PATH).exists():
+        warn("Existing config found at {}".format(CONFIG_PATH))
+        if not confirm("Overwrite existing config?", default=False):
+            info("Keeping existing config. Exiting.")
+            sys.exit(0)
+
+    if not confirm("Continue?"):
+        sys.exit(0)
+
+def step_check_tools():
+    header("Step 1 — Checking Required Tools")
+
+    tools = [
+        ("ltfs",    check_ltfs(),    "LTFS filesystem tools",        "dnf install ltfs"),
+        ("mkltfs",  check_mkltfs(),  "LTFS format utility",          "dnf install ltfs"),
+        ("mt-st",   tool_ok("mt") or tool_ok("mt-st"),
+                            "Tape control (mt)",            "dnf install mt-st  OR  build LTFS (includes mt)"),
+        ("lsscsi",  True,            "SCSI device lister",           "dnf install lsscsi"),
+        ("mtx",     check_mtx(),     "Media changer control (mtx)",  "dnf install mtx"),
+        ("rsync",   True,            "File sync",                    "dnf install rsync"),
+    ]
+
+    # Actually check each
+    checked = []
+    for name, _, desc, install in tools:
+        _, _, rc = run(["which", name])
+        ok = rc == 0
+        checked.append((name, ok, desc, install))
+
+    if RICH:
+        t = Table(box=box.SIMPLE_HEAVY)
+        t.add_column("Tool")
+        t.add_column("Status")
+        t.add_column("Description")
+        for name, ok, desc, _ in checked:
+            status = "[green]✔ installed[/green]" if ok else "[yellow]✘ missing[/yellow]"
+            t.add_row(name, status, desc)
+        console.print(t)
+    else:
+        for name, ok, desc, _ in checked:
+            status = "OK" if ok else "MISSING"
+            print("  {:12} {:10} {}".format(name, status, desc))
+
+    missing = [(n, i) for n, ok, _, i in checked if not ok]
+    missing_required = [(n, i) for n, ok, d, i in checked
+                        if not ok and n in ("ltfs", "mkltfs", "rsync")]
+
+    if missing_required:
+        print()
+        error("Required tools are missing. Install them before continuing:")
+        for name, install_cmd in missing_required:
+            if RICH:
+                console.print("    [dim]{}[/dim]".format(install_cmd))
+            else:
+                print("    {}".format(install_cmd))
+        pause()
+        sys.exit(1)
+
+    if missing:
+        print()
+        warn("Some optional tools are missing (mtx required only for library/changer).")
+
+    print()
+    info("Tool check complete.")
+    pause()
+
+def step_detect_devices():
+    header("Step 2 — Detecting Tape Devices")
+
+    info("Scanning SCSI devices...")
+    drives = detect_tape_drives()
+    changers = detect_changers()
+
+    print()
+    if drives:
+        if RICH:
+            console.print("  [bold]Tape Drives Found:[/bold]")
+            t = Table(box=box.SIMPLE_HEAVY)
+            t.add_column("#")
+            t.add_column("SG Device")
+            t.add_column("ST Device")
+            t.add_column("Model")
+            for i, d in enumerate(drives):
+                t.add_row(str(i), d["sg"], d["st"], d["model"])
+            console.print(t)
+        else:
+            print("  Tape Drives:")
+            for i, d in enumerate(drives):
+                print("  {}  {}  {}  {}".format(i, d["sg"], d["st"], d["model"]))
+    else:
+        warn("No tape drives detected. Make sure the drive is powered on and connected.")
+
+    print()
+    if changers:
+        if RICH:
+            console.print("  [bold]Media Changers Found:[/bold]")
+            t = Table(box=box.SIMPLE_HEAVY)
+            t.add_column("#")
+            t.add_column("SG Device")
+            t.add_column("Model")
+            for i, c in enumerate(changers):
+                t.add_row(str(i), c["sg"], c["model"])
+            console.print(t)
+        else:
+            print("  Media Changers:")
+            for i, c in enumerate(changers):
+                print("  {}  {}  {}".format(i, c["sg"], c["model"]))
+    else:
+        info("No media changers detected (single-drive mode).")
+
+    if not drives:
+        print()
+        if not confirm("No drives found. Continue anyway and configure manually?",
+                       default=False):
+            sys.exit(1)
+
+    pause()
+    return drives, changers
+
+def step_configure_drive(drives, cfg):
+    header("Step 3 — Configure Tape Drive")
+
+    if drives:
+        if len(drives) == 1:
+            d = drives[0]
+            info("Using detected drive: {} ({})".format(d["sg"], d["model"]))
+            sg = d["sg"]
+            st = d["nst"]
+        else:
+            if RICH:
+                console.print("  Multiple drives detected. Select primary drive:\n")
+            else:
+                print("  Multiple drives detected. Select primary drive:\n")
+            for i, d in enumerate(drives):
+                print("  {})  {} — {}".format(i, d["sg"], d["model"]))
+            choice = prompt("Drive number", default="0")
+            try:
+                d = drives[int(choice)]
+            except (ValueError, IndexError):
+                d = drives[0]
+            sg = d["sg"]
+            st = d["nst"]
+    else:
+        sg = prompt("SG device path", default="/dev/sg0")
+        st = prompt("ST device path (no-rewind)", default="/dev/nst0")
+
+    mount = prompt("Tape mount point", default="/mnt/tape")
+
+    cfg.set("device", "sg_device",   sg)
+    cfg.set("device", "st_device",   st)
+    cfg.set("device", "mount_point", mount)
+
+    info("Drive configured: {} / {}".format(sg, st))
+    pause()
+
+def step_configure_paths(cfg):
+    header("Step 4 — Configure Paths")
+
+    if RICH:
+        console.print(
+            "  [bold]Staging area[/bold] — local fast disk where data is buffered\n"
+            "  before writing to tape. Should have plenty of free space.\n"
+        )
+    else:
+        print("  Staging: local disk buffer before tape write.\n")
+
+    staging = prompt("Staging directory", default="/data/staging")
+    restore = prompt("Default restore directory", default="/data/restore")
+    state   = prompt("tapeman2 state directory", default="/var/lib/tapeman2")
+    log     = prompt("Log file", default="/var/log/tapeman2/tapeman2.log")
+
+    # Check staging free space
+    staging_path = Path(staging)
+    if staging_path.exists():
+        import shutil
+        free = shutil.disk_usage(staging).free
+        free_gb = free / 1024**3
+        if free_gb < 100:
+            warn("Staging only has {:.0f} GB free. Recommend 500 GB+.".format(free_gb))
+        else:
+            info("Staging has {:.0f} GB free.".format(free_gb))
+    else:
+        info("Staging directory will be created: {}".format(staging))
+
+    cfg.set("paths", "staging_dir", staging)
+    cfg.set("paths", "restore_dir", restore)
+    cfg.set("paths", "state_dir",   state)
+    cfg.set("paths", "db_path",     "{}/archives.db".format(state))
+    cfg.set("paths", "log_file",    log)
+
+    pause()
+
+def step_configure_archive(cfg):
+    header("Step 5 — Archive Settings")
+
+    if RICH:
+        console.print(
+            "  [bold]Checksum algorithm:[/bold] sha256 recommended (secure, fast enough)\n"
+            "  [bold]Tar bundling:[/bold] bundle many small files into one tar before writing\n"
+            "  Strongly recommended for cryo-EM movie stacks and other small-file datasets.\n"
+        )
+    else:
+        print("  Configure archive defaults.\n")
+
+    algo    = prompt("Checksum algorithm (sha256/md5)", default="sha256")
+    tar_def = confirm("Bundle small-file datasets as tar by default?", default=False)
+    min_stg = prompt("Minimum staging free space (GB) before archiving", default="50")
+    blksz   = prompt("LTFS block size (bytes)", default="524288")
+
+    cfg.set("archive", "checksum_algo",       algo)
+    cfg.set("archive", "tar_by_default",      "true" if tar_def else "false")
+    cfg.set("archive", "min_staging_free_gb", min_stg)
+    cfg.set("archive", "ltfs_blocksize",      blksz)
+
+    pause()
+
+def step_configure_changer(drives, changers, cfg):
+    header("Step 6 — Library / Changer Configuration")
+
+    if not changers and len(drives) <= 1:
+        info("No changer detected — configuring single drive mode.")
+        cfg.set("changer", "enabled", "false")
+        pause()
+        return
+
+    if RICH:
+        console.print(
+            "  A media changer or multiple drives were detected.\n"
+            "  Library mode enables automatic tape loading/unloading\n"
+            "  and multi-drive parallel archiving.\n"
+        )
+    else:
+        print("  Changer/library detected.\n")
+
+    enable = confirm("Enable library/changer support?", default=bool(changers))
+
+    if not enable:
+        cfg.set("changer", "enabled", "false")
+        info("Library support disabled.")
+        pause()
+        return
+
+    # Check mtx
+    if not check_mtx():
+        warn("mtx is not installed. Library support requires mtx.")
+        if confirm("Install mtx now? (dnf install mtx)", default=True):
+            os.system("dnf install -y mtx")
+            if not check_mtx():
+                error("mtx install failed. Disabling library support.")
+                cfg.set("changer", "enabled", "false")
+                pause()
+                return
+        else:
+            cfg.set("changer", "enabled", "false")
+            pause()
+            return
+
+    cfg.set("changer", "enabled", "true")
+
+    # Changer device
+    if changers:
+        if len(changers) == 1:
+            changer_dev = changers[0]["sg"]
+            info("Using changer: {} ({})".format(changer_dev, changers[0]["model"]))
+        else:
+            print("  Select changer device:")
+            for i, c in enumerate(changers):
+                print("  {})  {} — {}".format(i, c["sg"], c["model"]))
+            choice = prompt("Changer number", default="0")
+            try:
+                changer_dev = changers[int(choice)]["sg"]
+            except (ValueError, IndexError):
+                changer_dev = changers[0]["sg"]
+    else:
+        changer_dev = prompt("Changer SG device", default="/dev/sg1")
+
+    cfg.set("changer", "device", changer_dev)
+
+    # Drive count
+    drive_count = len(drives) if drives else 1
+    drive_count = prompt("Number of tape drives in library", default=str(drive_count))
+    cfg.set("changer", "drive_count", drive_count)
+
+    # Slot count — try to get from mtx
+    slot_count = "0"
+    if RICH:
+        console.print("  [dim]Querying library slot count via mtx...[/dim]")
+    else:
+        print("  Querying library slot count...")
+
+    out, _, rc = run(["mtx", "-f", changer_dev, "status"])
+    if rc == 0:
+        import re
+        storage = re.findall(r"Storage Element\s+(\d+)", out)
+        if storage:
+            slot_count = str(max(int(s) for s in storage))
+            info("Detected {} storage slots.".format(slot_count))
+        ie_slots = re.findall(r"Import/Export Element\s+(\d+)", out)
+        ie_count = str(len(ie_slots)) if ie_slots else "0"
+    else:
+        warn("Could not query library. Enter slot count manually.")
+        slot_count = prompt("Number of storage slots", default="24")
+        ie_count   = prompt("Number of import/export slots", default="1")
+
+    slot_count = prompt("Storage slot count", default=slot_count)
+    ie_count   = prompt("Import/Export slot count", default=ie_count if 'ie_count' in dir() else "1")
+
+    cfg.set("changer", "slot_count",    slot_count)
+    cfg.set("changer", "ie_slot_count", ie_count)
+    cfg.set("changer", "default_drive", "0")
+
+    print()
+    info("Library configured: {} drives, {} slots, {} I/E slots".format(
+        drive_count, slot_count, ie_count))
+    pause()
+
+def step_multi_drive(drives, cfg):
+    """Configure additional drives if library has more than one."""
+    if len(drives) <= 1:
+        return
+    if not cfg.getboolean("changer", "enabled", fallback=False):
+        return
+
+    header("Step 7 — Multi-Drive Configuration")
+
+    if RICH:
+        console.print(
+            "  Your library has [bold cyan]{}[/bold cyan] drives.\n\n"
+            "  tapeman2 can run parallel archive jobs across multiple drives,\n"
+            "  significantly increasing throughput for large archival tasks.\n".format(
+                len(drives))
+        )
+    else:
+        print("  {} drives available for parallel archiving.\n".format(len(drives)))
+
+    if RICH:
+        t = Table(box=box.SIMPLE_HEAVY, title="Detected Drives")
+        t.add_column("Drive #")
+        t.add_column("SG Device")
+        t.add_column("ST Device")
+        t.add_column("Model")
+        for i, d in enumerate(drives):
+            t.add_row(str(i), d["sg"], d["nst"], d["model"])
+        console.print(t)
+    else:
+        print("  Drive #  SG Device   ST Device   Model")
+        for i, d in enumerate(drives):
+            print("  {}        {}   {}   {}".format(i, d["sg"], d["nst"], d["model"]))
+
+    print()
+    # Store all drive devices in config
+    for i, d in enumerate(drives):
+        cfg.set("changer", "drive_{}_sg".format(i), d["sg"])
+        cfg.set("changer", "drive_{}_st".format(i), d["nst"])
+
+    info("All {} drives registered.".format(len(drives)))
+    pause()
+
+def step_review_and_save(cfg):
+    header("Step 8 — Review & Save")
+
+    if RICH:
+        console.print("  [bold]Configuration Summary:[/bold]\n")
+        t = Table(box=box.SIMPLE_HEAVY)
+        t.add_column("Setting", style="cyan")
+        t.add_column("Value")
+        for section in cfg.sections():
+            for key, val in cfg.items(section):
+                t.add_row("[{}] {}".format(section, key), val)
+        console.print(t)
+    else:
+        print("  Configuration Summary:\n")
+        for section in cfg.sections():
+            print("  [{}]".format(section))
+            for key, val in cfg.items(section):
+                print("    {} = {}".format(key, val))
+            print()
+
+    print()
+    if confirm("Save configuration to {}?".format(CONFIG_PATH), default=True):
+        save_config(cfg)
+        info("Configuration saved to {}".format(CONFIG_PATH))
+
+        # Re-initialize tapeman2 with new config
+        try:
+            sys.path.insert(0, "/usr/local/lib/tapeman2")
+            import tapeman2_core as core
+            core.initialize(CONFIG_PATH)
+            info("tapeman2 database and directories initialized.")
+        except Exception as e:
+            warn("Could not initialize tapeman2: {}".format(e))
+    else:
+        warn("Configuration not saved.")
+
+    pause()
+
+def step_done():
+    header("Setup Complete")
+
+    if RICH:
+        console.print(
+            "  [green bold]tapeman2 is configured and ready.[/green bold]\n\n"
+            "  [bold]Start the TUI:[/bold]\n"
+            "    [cyan]tapeman2[/cyan]\n\n"
+            "  [bold]Start the GUI (requires SSH -Y or local display):[/bold]\n"
+            "    [cyan]tapeman2-gui[/cyan]\n\n"
+            "  [bold]Re-run this wizard anytime:[/bold]\n"
+            "    [cyan]tapeman2-setup[/cyan]\n\n"
+            "  [bold]Config file:[/bold]  /etc/tapeman2/tapeman2.conf\n"
+            "  [bold]Database:[/bold]     /var/lib/tapeman2/archives.db\n"
+            "  [bold]Log:[/bold]          /var/log/tapeman2/tapeman2.log\n"
+        )
+    else:
+        print("  tapeman2 is configured and ready.\n")
+        print("  TUI:    tapeman2")
+        print("  GUI:    tapeman2-gui")
+        print("  Config: /etc/tapeman2/tapeman2.conf\n")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    if os.geteuid() != 0:
+        print("tapeman2-setup must be run as root (system configuration tool).")
+        print("Run: sudo tapeman2-setup")
+        sys.exit(1)
+
+    cfg = configparser.ConfigParser()
+    ensure_sections(cfg)
+
+    # Set defaults
+    cfg.set("ui", "date_format",  "%%Y-%%m-%%d %%H:%%M")
+    cfg.set("ui", "page_size",    "20")
+
+    step_welcome()
+    step_check_tools()
+    drives, changers = step_detect_devices()
+    step_configure_drive(drives, cfg)
+    step_configure_paths(cfg)
+    step_configure_archive(cfg)
+    step_configure_changer(drives, changers, cfg)
+    step_multi_drive(drives, cfg)
+    step_review_and_save(cfg)
+    step_done()
+
+if __name__ == "__main__":
+    main()

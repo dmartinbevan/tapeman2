@@ -1,7 +1,6 @@
 # TapeMan 2
 
 A tape archival management system for Linux and macOS with LTO tape drives.
-Built for the Department of Structural Biology, University of Pittsburgh.
 
 ## Features
 
@@ -167,6 +166,4 @@ MIT License — see LICENSE file.
 
 ## Author
 
-Doug Bevan  
-IT Systems Engineer, Department of Structural Biology  
-University of Pittsburgh
+Doug Bevan

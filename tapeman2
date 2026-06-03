@@ -68,14 +68,11 @@ def pause():
 def header(subtitle=""):
     clear()
     if RICH:
-        # Use ANSI directly for reliable color rendering
-        title = (
-            "\033[1;36mTapeMan 2\033[0m"
-            "  \033[2mQuantum LTO-9 Archive Manager\033[0m"
-        )
+        from rich.panel import Panel
+        content = "[bold cyan]TapeMan 2[/bold cyan]  [dim]Quantum LTO-9 Archive Manager[/dim]"
         if subtitle:
-            title += "\n\033[2m{}\033[0m".format(subtitle)
-        console.print(Panel.fit(title, border_style="cyan"))
+            content += "\n[dim]{}[/dim]".format(subtitle)
+        console.print(Panel.fit(content, border_style="cyan"))
     else:
         print("=" * 60)
         print("  TapeMan 2 — Quantum LTO-9 Archive Manager")
@@ -1316,14 +1313,10 @@ def _wait_with_countdown(timeout=60):
         if remaining <= 0:
             return None
 
-        # Overwrite the countdown line in place (single line, no scroll)
-        if RICH:
-            sys.stdout.write(
-                "\r  \033[2K\033[36m↻\033[0m  \033[2mStatus refresh in {}s\033[0m  "
-                "  \033[36mEnter choice:\033[0m ".format(remaining))
-        else:
-            sys.stdout.write(
-                "\r  Status refresh in {}s    Enter choice: ".format(remaining))
+        # Overwrite countdown line in place using plain stdout
+        # (rich console can't do \r overwrite, plain text works fine here)
+        sys.stdout.write(
+            "\r  ↻ Status refresh in {:2d}s    Enter choice: ".format(remaining))
         sys.stdout.flush()
 
         ready, _, _ = select.select([sys.stdin], [], [], 1.0)
@@ -1349,28 +1342,38 @@ def status_line():
     if RICH:
         if mounted:
             free_str = _tape_free_nonblocking()
-            console.print(
-                "  \033[32m●\033[0m  \033[1mTape:\033[0m  "
-                "\033[32mMounted at {}\033[0m  \033[2m({})\033[0m".format(
-                    MOUNT, free_str))
+            console.print("  [green]●[/green]  [bold]Tape:[/bold]  "
+                          "[green]Mounted at {}[/green]  [dim]({})[/dim]".format(
+                              MOUNT, free_str))
         else:
             state, msg = core.tape_drive_state(ST, SG)
             if state == plat.TAPE_STATE_INITIALIZING:
-                console.print(
-                    "  \033[33m⏳\033[0m  \033[1mTape:\033[0m  "
-                    "\033[33mInitializing\033[0m  \033[2m— {}\033[0m".format(msg))
+                console.print("  [yellow]⏳[/yellow]  [bold]Tape:[/bold]  "
+                              "[yellow]Initializing[/yellow]  "
+                              "[dim]— {}[/dim]".format(msg))
             elif state == plat.TAPE_STATE_NO_TAPE:
-                console.print(
-                    "  \033[2m○\033[0m  \033[1mTape:\033[0m  "
-                    "\033[2mNo tape loaded\033[0m")
+                console.print("  [dim]○[/dim]  [bold]Tape:[/bold]  "
+                              "[dim]No tape loaded[/dim]")
             elif state == plat.TAPE_STATE_NOT_READY:
-                console.print(
-                    "  \033[33m○\033[0m  \033[1mTape:\033[0m  "
-                    "\033[33mNot ready — loading...\033[0m")
+                console.print("  [yellow]○[/yellow]  [bold]Tape:[/bold]  "
+                              "[yellow]Not ready — loading...[/yellow]")
             else:
-                console.print(
-                    "  \033[33m○\033[0m  \033[1mTape:\033[0m  "
-                    "\033[2mNot mounted\033[0m")
+                console.print("  [yellow]○[/yellow]  [bold]Tape:[/bold]  "
+                              "[dim]Not mounted[/dim]")
+
+        # Active jobs
+        active = core.active_job_count(STATE_DIR)
+        if active:
+            console.print("  [cyan]⚙[/cyan]  [bold]Jobs:[/bold]  "
+                          "[cyan]{} job{} running[/cyan]".format(
+                              active, "s" if active != 1 else ""))
+
+        # Cleaning warning
+        needs_clean, clean_msg = _cleaning_status_nonblocking()
+        if needs_clean:
+            console.print("  [bold red]⚠[/bold red]  [bold red]Drive cleaning "
+                          "required[/bold red]  [dim]— {}[/dim]".format(clean_msg))
+
     else:
         if mounted:
             free_str = _tape_free_nonblocking()
@@ -1385,23 +1388,13 @@ def status_line():
                 print("  Tape: not ready — loading...")
             else:
                 print("  Tape: not mounted")
-
-    # Active jobs
-    active = core.active_job_count(STATE_DIR)
-    if active:
-        console.print(
-            "  \033[36m⚙\033[0m  \033[1mJobs:\033[0m  "
-            "\033[36m{} job{} running\033[0m".format(
-                active, "s" if active != 1 else "")) if RICH else \
-        print("  Jobs: {} job{} running".format(active, "s" if active != 1 else ""))
-
-    # Cleaning warning
-    needs_clean, clean_msg = _cleaning_status_nonblocking()
-    if needs_clean:
-        console.print(
-            "  \033[31m⚠\033[0m  \033[1;31mDrive cleaning required\033[0m  "
-            "\033[2m— {}\033[0m".format(clean_msg)) if RICH else \
-        print("  *** DRIVE CLEANING REQUIRED — {} ***".format(clean_msg))
+        active = core.active_job_count(STATE_DIR)
+        if active:
+            print("  Jobs: {} job{} running".format(
+                active, "s" if active != 1 else ""))
+        needs_clean, clean_msg = _cleaning_status_nonblocking()
+        if needs_clean:
+            print("  *** DRIVE CLEANING REQUIRED — {} ***".format(clean_msg))
 
     print()
 
@@ -1416,8 +1409,7 @@ def main():
         status_line()
 
         if RICH:
-            # Menu with better color scheme
-            console.print("  \033[1mMain Menu\033[0m\n")
+            console.print("  [bold]Main Menu[/bold]\n")
             items = [
                 ("1", "Archive a dataset"),
                 ("2", "Restore a dataset"),
@@ -1429,8 +1421,7 @@ def main():
                 ("q", "Quit"),
             ]
             for k, label in items:
-                console.print(
-                    "  \033[36m{}\033[0m\033[2m)\033[0m  {}".format(k, label))
+                console.print("  [cyan]{}[/cyan][dim])[/dim]  {}".format(k, label))
             console.print()
         else:
             print("  Main Menu\n")
@@ -1462,10 +1453,7 @@ def main():
         elif choice == "7":
             do_library()
         elif choice in ("q", "quit", "exit"):
-            if RICH:
-                console.print("\n  \033[2mGoodbye.\033[0m\n")
-            else:
-                print("\n  Goodbye.\n")
+            console.print("\n  [dim]Goodbye.[/dim]\n") if RICH else print("\n  Goodbye.\n")
             sys.exit(0)
 
 if __name__ == "__main__":

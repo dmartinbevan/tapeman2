@@ -96,6 +96,23 @@ TAPE_STATE_NO_TAPE      = "no_tape"
 TAPE_STATE_NOT_READY    = "not_ready"
 TAPE_STATE_UNKNOWN      = "unknown"
 
+def tape_ready_progress(sg_device):
+    """
+    Query sg_turs -v and parse the 'becoming ready' progress percentage.
+    Returns float 0-100 if the drive reports progress, else None.
+    """
+    if not sg_device:
+        return None
+    result = run_cmd(["sg_turs", "-v", sg_device], timeout=10)
+    text = result.stdout + result.stderr
+    m = re.search(r"Progress indication:\s*([\d.]+)%", text)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            return None
+    return None
+
 def tape_drive_state(st_device, sg_device=None):
     """
     Returns (state, message).
@@ -117,15 +134,29 @@ def tape_drive_state(st_device, sg_device=None):
         if "NOT READY" in out or "ILI" in out:
             return TAPE_STATE_NOT_READY, "Drive not ready"
 
-    # sg_turs — Test Unit Ready
+    # sg_turs — Test Unit Ready (with progress detection)
     if sg_device:
-        result = run_cmd(["sg_turs", sg_device], timeout=10)
+        result = run_cmd(["sg_turs", "-v", sg_device], timeout=10)
+        text = result.stdout + result.stderr
         if result.returncode != 0:
-            err = (result.stdout + result.stderr).lower()
-            if "initializ" in err or "04/03" in err:
+            low = text.lower()
+            # Parse progress percentage if present
+            pct = None
+            m = re.search(r"progress indication:\s*([\d.]+)%", low)
+            if m:
+                try:
+                    pct = float(m.group(1))
+                except ValueError:
+                    pct = None
+
+            if "becoming ready" in low or "initializ" in low or "04/03" in low \
+               or "04/01" in low or pct is not None:
+                if pct is not None:
+                    return TAPE_STATE_INITIALIZING, \
+                        "Tape initializing — {:.0f}% complete".format(pct)
                 return TAPE_STATE_INITIALIZING, \
                     "Tape initializing — new LTO-9 cartridges require 15-30 min"
-            if "no medium" in err or "no tape" in err:
+            if "no medium" in low or "no tape" in low or "3a" in low:
                 return TAPE_STATE_NO_TAPE, "No tape loaded"
             return TAPE_STATE_NOT_READY, "Drive not ready"
         return TAPE_STATE_READY, "Tape ready"
@@ -136,6 +167,7 @@ def wait_for_tape_ready(st_device, sg_device=None,
                          timeout_minutes=40, progress_cb=None):
     """
     Poll until tape is ready or timeout. Returns (bool, message).
+    Displays live initialization progress percentage when available.
     """
     import time
     interval  = 10
@@ -154,12 +186,23 @@ def wait_for_tape_ready(st_device, sg_device=None,
         secs = elapsed % 60
         timer = "{}m {}s".format(mins, secs) if mins else "{}s".format(secs)
 
+        # Try to get a live progress percentage
+        pct = tape_ready_progress(sg_device)
+
         if state == TAPE_STATE_INITIALIZING:
-            status_msg = ("⏳ Tape initializing ({} elapsed) — "
-                          "new LTO-9 cartridges require 15-30 min. "
-                          "Please wait...".format(timer))
+            if pct is not None:
+                status_msg = ("⏳ Tape initializing — {:.0f}% complete "
+                              "({} elapsed)...".format(pct, timer))
+            else:
+                status_msg = ("⏳ Tape initializing ({} elapsed) — "
+                              "new LTO-9 cartridges require 15-30 min. "
+                              "Please wait...".format(timer))
         else:
-            status_msg = "⏳ Drive not ready ({} elapsed) — waiting...".format(timer)
+            if pct is not None:
+                status_msg = ("⏳ Drive becoming ready — {:.0f}% complete "
+                              "({} elapsed)...".format(pct, timer))
+            else:
+                status_msg = "⏳ Drive not ready ({} elapsed) — waiting...".format(timer)
 
         if progress_cb:
             progress_cb(status_msg)

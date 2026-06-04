@@ -655,6 +655,39 @@ class VerifyTab(ttk.Frame, LogMixin):
 
 # ── Jobs Tab ──────────────────────────────────────────────────────────────────
 
+def _gui_job_elapsed(j):
+    import datetime as _dt
+    started = j.get("started")
+    if not started:
+        return "—"
+    try:
+        t0 = _dt.datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "—"
+    finished = j.get("finished")
+    if finished:
+        try:
+            t1 = _dt.datetime.strptime(finished, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            t1 = _dt.datetime.now()
+    else:
+        t1 = _dt.datetime.now()
+    secs = max(0, int((t1 - t0).total_seconds()))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "{}h {}m".format(h, m)
+    if m:
+        return "{}m {}s".format(m, s)
+    return "{}s".format(s)
+
+def _gui_job_pct(j):
+    status = j.get("status", "")
+    if status == core.JOB_STATUS_COMPLETE:
+        return "100%"
+    pct = j.get("percent")
+    return "—" if pct is None else "{}%".format(pct)
+
 class JobsTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
@@ -677,16 +710,16 @@ class JobsTab(ttk.Frame):
         frame = ttk.Frame(self, padding=(16,4))
         frame.pack(fill="both", expand=True)
 
-        cols = ("job_id","type","dataset","status","progress","started","finished")
+        cols = ("job_id","type","dataset","status","percent","elapsed","progress")
         self.tree = ttk.Treeview(frame, columns=cols, show="headings")
         for col, w, heading in [
-            ("job_id",   90,  "Job ID"),
-            ("type",     70,  "Type"),
-            ("dataset", 180,  "Dataset / Archive"),
-            ("status",   90,  "Status"),
-            ("progress",280,  "Progress"),
-            ("started",  130, "Started"),
-            ("finished", 130, "Finished"),
+            ("job_id",   85,  "Job ID"),
+            ("type",     65,  "Type"),
+            ("dataset", 160,  "Dataset / Archive"),
+            ("status",   85,  "Status"),
+            ("percent",  55,  "%"),
+            ("elapsed",  80,  "Elapsed"),
+            ("progress",250,  "Progress"),
         ]:
             self.tree.heading(col, text=heading)
             self.tree.column(col, width=w, anchor="w")
@@ -724,16 +757,15 @@ class JobsTab(ttk.Frame):
         for j in jobs:
             status   = j.get("status","")
             dataset  = j.get("name") or j.get("archive_id") or "—"
-            finished = (j.get("finished") or "")[:16] or "—"
             iid = self.tree.insert("", "end", iid=j.get("job_id",""),
                 values=(
                     j.get("job_id",""),
                     j.get("type",""),
                     dataset,
                     status,
+                    _gui_job_pct(j),
+                    _gui_job_elapsed(j),
                     j.get("progress",""),
-                    (j.get("started") or "")[:16],
-                    finished,
                 ), tags=(status,))
 
         # Update status bar active job count

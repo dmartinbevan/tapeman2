@@ -804,6 +804,36 @@ def import_full_tape(
     progress("✔ Import complete — {} entries registered.".format(len(records)))
     return records
 
+def _rsync_with_progress(src, dst, progress_cb=None, phase=""):
+    """
+    Run rsync with live progress parsing. Parses --info=progress2 output
+    and calls progress_cb with a message containing 'NN%' so the job file
+    can extract a percentage. Returns rsync's exit code.
+    """
+    import re as _re
+    proc = subprocess.Popen(
+        ["rsync", "-a", "--info=progress2", src, dst],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        universal_newlines=True, bufsize=1)
+
+    last_pct = -1
+    pct_re = _re.compile(r"(\d+)%")
+    for line in iter(proc.stdout.readline, ""):
+        line = line.strip()
+        if not line:
+            continue
+        m = pct_re.search(line)
+        if m:
+            pct = int(m.group(1))
+            # Only report when the percentage changes by >=1 to avoid spamming
+            if pct != last_pct:
+                last_pct = pct
+                if progress_cb:
+                    label = "{} ".format(phase) if phase else ""
+                    progress_cb("{}{}% complete".format(label, pct))
+    proc.stdout.close()
+    return proc.wait()
+
 # ── Archive ───────────────────────────────────────────────────────────────────
 
 def archive_dataset(
@@ -867,14 +897,11 @@ def archive_dataset(
             else:
                 size_bytes, file_count = dir_size_and_count(source_path)
                 progress("Copying directly to tape: {}".format(tape_dest))
-                result = subprocess.run(
-                    ["rsync", "-a", "--info=progress2",
-                     source_path + "/", tape_dest + "/"],
-                    stdout=None, stderr=None, universal_newlines=True
-                )
-                if result.returncode != 0:
-                    raise ArchiveError("rsync to tape failed (exit {})".format(
-                        result.returncode))
+                rc = _rsync_with_progress(
+                    source_path + "/", tape_dest + "/",
+                    progress_cb=progress_cb, phase="Writing to tape")
+                if rc != 0:
+                    raise ArchiveError("rsync to tape failed (exit {})".format(rc))
                 progress("Computing tape checksum...")
                 checksum_src  = checksum_tree(tape_dest, checksum_algo)
                 checksum_tape = checksum_src
@@ -898,14 +925,11 @@ def archive_dataset(
             else:
                 dest = os.path.join(stage_path, os.path.basename(source_path))
                 progress("Staging data to {}...".format(stage_path))
-                result = subprocess.run(
-                    ["rsync", "-a", "--info=progress2",
-                     source_path + "/", dest + "/"],
-                    stdout=None, stderr=None, universal_newlines=True
-                )
-                if result.returncode != 0:
-                    raise ArchiveError("rsync staging failed (exit {})".format(
-                        result.returncode))
+                rc = _rsync_with_progress(
+                    source_path + "/", dest + "/",
+                    progress_cb=progress_cb, phase="Staging")
+                if rc != 0:
+                    raise ArchiveError("rsync staging failed (exit {})".format(rc))
                 staged_path = dest
                 size_bytes, file_count = dir_size_and_count(staged_path)
 
@@ -924,14 +948,11 @@ def archive_dataset(
                 shutil.copy2(staged_path, os.path.join(tape_dest, tar_name))
                 tape_file = os.path.join(tape_dest, tar_name)
             else:
-                result = subprocess.run(
-                    ["rsync", "-a", "--info=progress2",
-                     staged_path + "/", tape_dest + "/"],
-                    stdout=None, stderr=None, universal_newlines=True
-                )
-                if result.returncode != 0:
-                    raise ArchiveError("rsync to tape failed (exit {})".format(
-                        result.returncode))
+                rc = _rsync_with_progress(
+                    staged_path + "/", tape_dest + "/",
+                    progress_cb=progress_cb, phase="Writing to tape")
+                if rc != 0:
+                    raise ArchiveError("rsync to tape failed (exit {})".format(rc))
 
             progress("Verifying tape copy...")
             if use_tar:
@@ -1559,6 +1580,17 @@ def _read_job(job_file):
     except Exception:
         return None
 
+def _extract_percent(msg):
+    """Pull an NN% value out of a progress message, or None."""
+    import re as _re
+    m = _re.search(r"(\d+)%", msg or "")
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            return None
+    return None
+
 def list_jobs(state_dir, status=None):
     """Return list of all job dicts, optionally filtered by status."""
     jdir = _jobs_dir(state_dir)
@@ -1722,6 +1754,9 @@ def process_queue(state_dir, db_path, cfg, sg_device="", st_device="",
                 jj = _read_job(_job_file(state_dir, _jid)) or {}
                 jj["progress"] = msg
                 jj["status"]   = JOB_STATUS_RUNNING
+                _pct = _extract_percent(msg)
+                if _pct is not None:
+                    jj["percent"] = _pct
                 _write_job(state_dir, jj)
 
             try:
@@ -1828,6 +1863,9 @@ def submit_archive_job(
             j["progress"] = msg
             j["status"]   = JOB_STATUS_RUNNING
             j["pid"]      = os.getpid()
+            _pct = _extract_percent(msg)
+            if _pct is not None:
+                j["percent"] = _pct
             _write_job(state_dir, j)
 
         # Update status to running
@@ -1923,6 +1961,9 @@ def submit_restore_job(
             j["progress"] = msg
             j["status"]   = JOB_STATUS_RUNNING
             j["pid"]      = os.getpid()
+            _pct = _extract_percent(msg)
+            if _pct is not None:
+                j["percent"] = _pct
             _write_job(state_dir, j)
 
         job["status"] = JOB_STATUS_RUNNING
@@ -2008,6 +2049,9 @@ def submit_verify_job(
             j["progress"] = msg
             j["status"]   = JOB_STATUS_RUNNING
             j["pid"]      = os.getpid()
+            _pct = _extract_percent(msg)
+            if _pct is not None:
+                j["percent"] = _pct
             _write_job(state_dir, j)
 
         job["status"] = JOB_STATUS_RUNNING

@@ -800,6 +800,45 @@ def _job_status_color(status):
     return {"running":"cyan","complete":"green","failed":"red",
             "cancelled":"dim","queued":"yellow"}.get(status,"white")
 
+def _job_elapsed(j):
+    """Compute elapsed/duration string for a job."""
+    import datetime as _dt
+    started = j.get("started")
+    if not started:
+        return "—"
+    try:
+        t0 = _dt.datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return "—"
+    finished = j.get("finished")
+    if finished:
+        try:
+            t1 = _dt.datetime.strptime(finished, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            t1 = _dt.datetime.now()
+    else:
+        t1 = _dt.datetime.now()
+    secs = int((t1 - t0).total_seconds())
+    if secs < 0:
+        secs = 0
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return "{}h {}m".format(h, m)
+    if m:
+        return "{}m {}s".format(m, s)
+    return "{}s".format(s)
+
+def _job_pct_str(j):
+    """Percent string for a job — only meaningful while running/complete."""
+    status = j.get("status", "")
+    pct = j.get("percent")
+    if status == core.JOB_STATUS_COMPLETE:
+        return "100%"
+    if pct is None:
+        return "—"
+    return "{}%".format(pct)
+
 def show_jobs_table(jobs, title="Jobs"):
     if not jobs:
         warn("No jobs found.")
@@ -810,33 +849,31 @@ def show_jobs_table(jobs, title="Jobs"):
         t = Table(title=title, box=rbox.SIMPLE_HEAVY)
         t.add_column("Job ID",  style="cyan", no_wrap=True)
         t.add_column("Type",    style="dim",  no_wrap=True)
-        t.add_column("Dataset/Archive", max_width=24)
+        t.add_column("Dataset/Archive", max_width=22)
         t.add_column("Status",  no_wrap=True)
-        t.add_column("Progress", max_width=36)
-        t.add_column("Started", style="dim", no_wrap=True)
-        t.add_column("Finished",style="dim", no_wrap=True)
+        t.add_column("%", justify="right", no_wrap=True)
+        t.add_column("Elapsed", style="dim", no_wrap=True)
+        t.add_column("Progress", max_width=30)
         for j in jobs:
             c = _job_status_color(j.get("status",""))
             dataset  = j.get("name") or j.get("archive_id") or "—"
-            finished = (j.get("finished") or "")[:16] or "—"
             t.add_row(
                 j.get("job_id",""), j.get("type",""), dataset,
                 "[{}]{}[/{}]".format(c, j.get("status",""), c),
+                _job_pct_str(j), _job_elapsed(j),
                 j.get("progress",""),
-                (j.get("started") or "")[:16], finished,
             )
         console.print(t)
     else:
-        fmt = "{:<10} {:<10} {:<20} {:<12} {:<32} {:<17} {}"
-        print(fmt.format("Job ID","Type","Dataset","Status","Progress","Started","Finished"))
-        print("-"*110)
+        fmt = "{:<10} {:<9} {:<18} {:<11} {:<5} {:<9} {}"
+        print(fmt.format("Job ID","Type","Dataset","Status","%","Elapsed","Progress"))
+        print("-"*100)
         for j in jobs:
-            dataset  = (j.get("name") or j.get("archive_id") or "—")[:19]
-            finished = (j.get("finished") or "")[:16] or "—"
+            dataset  = (j.get("name") or j.get("archive_id") or "—")[:17]
             print(fmt.format(
                 j.get("job_id",""), j.get("type",""), dataset,
-                j.get("status",""), (j.get("progress","") or "")[:31],
-                (j.get("started") or "")[:16], finished,
+                j.get("status",""), _job_pct_str(j), _job_elapsed(j),
+                (j.get("progress","") or "")[:30],
             ))
 
 def do_jobs():

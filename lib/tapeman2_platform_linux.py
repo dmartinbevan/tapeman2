@@ -238,21 +238,71 @@ def mount_tape(sg_device, mount_point, progress_cb=None, st_device=None):
 
     if progress_cb:
         progress_cb("Mounting tape...")
-    result = run_cmd(
+
+    # ltfs runs as a FUSE daemon — it backgrounds itself once mounted and
+    # does NOT return. So we launch it and poll for the mount to appear,
+    # rather than waiting for the command to exit (which would always time out).
+    import subprocess as _sp
+    import time as _time
+
+    proc = _sp.Popen(
         ["ltfs", "-o", "devname={}".format(sg_device), mount_point],
-        timeout=120
-    )
-    if not is_mounted(mount_point):
-        stderr = result.stderr + result.stdout
-        if "not partitioned" in stderr or "medium is not partitioned" in stderr:
-            raise RuntimeError(
-                "Tape is not formatted with LTFS.\n"
-                "Format it first via Tape Management → Format tape.\n"
-                "(Warning: formatting erases all data on the tape.)")
-        if "no medium" in stderr.lower() or "no tape" in stderr.lower():
-            raise RuntimeError("No tape loaded. Please insert a cartridge.")
-        raise RuntimeError("Failed to mount tape:\n{}\n{}".format(
-            result.stderr, result.stdout))
+        stdout=_sp.PIPE, stderr=_sp.PIPE, universal_newlines=True)
+
+    # Poll for up to 5 minutes for the mount to come up
+    mount_timeout = 300
+    waited = 0
+    captured_err = ""
+    while waited < mount_timeout:
+        if is_mounted(mount_point):
+            if progress_cb:
+                progress_cb("✔ Tape mounted at {}".format(mount_point))
+            return
+
+        # Check if ltfs exited (it daemonizes on success, or exits on error)
+        rc = proc.poll()
+        if rc is not None:
+            # Process exited. On success ltfs forks to background and the
+            # mount may take a moment to appear; on failure it exits non-zero.
+            # Give the mount a brief grace period to show up.
+            for _ in range(5):
+                if is_mounted(mount_point):
+                    if progress_cb:
+                        progress_cb("✔ Tape mounted at {}".format(mount_point))
+                    return
+                _time.sleep(1)
+            # Still not mounted — collect output to diagnose
+            try:
+                out, err = proc.communicate(timeout=5)
+                captured_err = (err or "") + (out or "")
+            except Exception:
+                pass
+            break
+
+        _time.sleep(2)
+        waited += 2
+        if progress_cb and waited % 20 == 0:
+            progress_cb("Still mounting... ({}s)".format(waited))
+
+    # If we get here, mount didn't come up
+    if is_mounted(mount_point):
+        return
+
+    stderr = captured_err
+    low = stderr.lower()
+    if "not partitioned" in low or "medium is not partitioned" in low:
+        raise RuntimeError(
+            "Tape is not formatted with LTFS.\n"
+            "Format it first via Tape Management → Format tape.\n"
+            "(Warning: formatting erases all data on the tape.)")
+    if "no medium" in low or "no tape" in low:
+        raise RuntimeError("No tape loaded. Please insert a cartridge.")
+    if not stderr.strip():
+        raise RuntimeError(
+            "Mount did not complete within {}s.\n"
+            "The tape may still be initializing — check Tape Management → "
+            "Drive status, and try again once it shows ready.".format(mount_timeout))
+    raise RuntimeError("Failed to mount tape:\n{}".format(stderr))
 
 # ── Error Counters (tape health) ──────────────────────────────────────────────
 

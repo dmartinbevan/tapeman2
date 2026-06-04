@@ -115,6 +115,8 @@ def status_line():
             console.print("  [bold red]⚠[/bold red]  [bold red]DRIVE CLEANING "
                           "REQUIRED[/bold red]  [dim]— {}[/dim]".format(clean_msg))
 
+        console.print("  [dim]↻  Status auto-refreshes every 60s[/dim]")
+
     else:
         if mounted:
             free_str = _tape_free_nonblocking()
@@ -136,6 +138,7 @@ def status_line():
         needs_clean, clean_msg = _cleaning_status_nonblocking()
         if needs_clean:
             print("  *** DRIVE CLEANING REQUIRED — {} ***".format(clean_msg))
+        print("  Status auto-refreshes every 60s")
 
     print()
 
@@ -1312,6 +1315,7 @@ def _check_permissions():
 
 
 def main():
+    import select
     import sys
 
     _check_permissions()
@@ -1344,12 +1348,18 @@ def main():
                 print("  {})  {}".format(k, l))
             print()
 
-        choice = prompt("Enter choice  [dim](status refreshes every 60s — press Enter to refresh now)[/dim]"
-                        if RICH else
-                        "Enter choice (press Enter to refresh status)")
+        sys.stdout.write("  Enter choice: ")
+        sys.stdout.flush()
+
+        ready, _, _ = select.select([sys.stdin], [], [], 60)
+        if not ready:
+            sys.stdout.write("\n")
+            continue  # timed out — redraw with fresh status
+
+        choice = sys.stdin.readline().strip().lower()
 
         if not choice:
-            continue  # blank Enter — refresh status
+            continue
 
         if choice == "1":
             do_archive()

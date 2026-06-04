@@ -81,7 +81,7 @@ def header(subtitle=""):
         print("=" * 60)
     print()
 
-def status_line(countdown=None):
+def status_line():
     mounted = core.is_mounted(MOUNT)
     plat    = core._get_platform()
 
@@ -115,9 +115,6 @@ def status_line(countdown=None):
             console.print("  [bold red]⚠[/bold red]  [bold red]DRIVE CLEANING "
                           "REQUIRED[/bold red]  [dim]— {}[/dim]".format(clean_msg))
 
-        if countdown is not None:
-            console.print("  [dim]↻  Status refresh in {}s[/dim]".format(countdown))
-
     else:
         if mounted:
             free_str = _tape_free_nonblocking()
@@ -132,18 +129,13 @@ def status_line(countdown=None):
                 print("  Tape: not ready — loading...")
             else:
                 print("  Tape: not mounted")
-
         active = core.active_job_count(STATE_DIR)
         if active:
             print("  Jobs: {} job{} running".format(
                 active, "s" if active != 1 else ""))
-
         needs_clean, clean_msg = _cleaning_status_nonblocking()
         if needs_clean:
             print("  *** DRIVE CLEANING REQUIRED — {} ***".format(clean_msg))
-
-        if countdown is not None:
-            print("  Status refresh in {}s".format(countdown))
 
     print()
 
@@ -1319,139 +1311,45 @@ def _check_permissions():
     sys.exit(1)
 
 
-def _wait_with_countdown(timeout=60):
-    """
-    Wait for input with a countdown. Only redraws the screen if the user
-    hasn't started typing yet. Once a key is pressed, stops refreshing
-    and waits for Enter normally.
-    Returns (input_string, remaining_seconds) or (None, 0) on timeout.
-    """
-    import select
-    import sys
-    import time
-    import tty
-    import termios
-
-    deadline  = time.time() + timeout
-    typed     = []
-    last_draw = time.time()
-
-    # Put terminal in raw mode so we can detect individual keypresses
-    fd = sys.stdin.fileno()
-    try:
-        old_settings = termios.tcgetattr(fd)
-        tty.setcbreak(fd)  # cbreak: send chars immediately, keep Ctrl+C etc
-    except Exception:
-        # If terminal manipulation fails (e.g. not a tty), fall back to
-        # simple blocking input
-        sys.stdout.write("  Enter choice: ")
-        sys.stdout.flush()
-        line = sys.stdin.readline().strip().lower()
-        return line if line else None
-
-    try:
-        while True:
-            remaining = max(0, int(deadline - time.time()))
-
-            if remaining <= 0:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                return None
-
-            # If user hasn't started typing, update the countdown line
-            # by redrawing the whole screen every 5s (or last 10s every 1s)
-            if not typed:
-                now = time.time()
-                redraw_interval = 1 if remaining <= 10 else 5
-                if now - last_draw >= redraw_interval:
-                    _draw_main_menu(remaining)
-                    last_draw = now
-
-            # Poll for a keypress — 0.25s granularity
-            ready, _, _ = select.select([sys.stdin], [], [], 0.25)
-            if not ready:
-                continue
-
-            ch = sys.stdin.read(1)
-
-            if ch in ('\n', '\r'):
-                # Enter pressed — submit
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                result = "".join(typed).strip().lower()
-                return result if result else None
-
-            elif ch in ('\x7f', '\x08'):
-                # Backspace
-                if typed:
-                    typed.pop()
-                    sys.stdout.write("\b \b")
-                    sys.stdout.flush()
-
-            elif ch == '\x03':
-                # Ctrl+C
-                raise KeyboardInterrupt
-
-            elif ch.isprintable():
-                # Regular character — show it and add to buffer
-                if not typed:
-                    # First keypress — print the prompt if not already shown
-                    # (after a redraw the prompt is already there)
-                    pass
-                typed.append(ch)
-                sys.stdout.write(ch)
-                sys.stdout.flush()
-
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-
-def _draw_main_menu(remaining):
-    """Draw the full main menu screen including countdown in status area."""
-    header()
-    status_line(countdown=remaining)
-
-    if RICH:
-        console.print("  [bold]Main Menu[/bold]\n")
-        for k, label in [
-            ("1", "Archive a dataset"),
-            ("2", "Restore a dataset"),
-            ("3", "Verify archives"),
-            ("4", "Browse inventory & search"),
-            ("5", "Tape management  (mount / unmount / format)"),
-            ("6", "Jobs  (background archive / restore / verify)"),
-            ("7", "Library / changer management"),
-            ("q", "Quit"),
-        ]:
-            console.print("  [cyan]{}[/cyan][dim])[/dim]  {}".format(k, label))
-        console.print()
-        console.print("  Enter choice: ", end="")
-    else:
-        print("  Main Menu\n")
-        for k, l in [("1","Archive a dataset"),("2","Restore a dataset"),
-                      ("3","Verify archives"),("4","Browse inventory & search"),
-                      ("5","Tape management (mount / unmount / format)"),
-                      ("6","Jobs (background archive/restore/verify)"),
-                      ("7","Library / changer management"),("q","Quit")]:
-            print("  {})  {}".format(k, l))
-        print()
-        sys.stdout.write("  Enter choice: ")
-        sys.stdout.flush()
-
-
 def main():
-    import time
+    import sys
 
     _check_permissions()
 
-    REFRESH_INTERVAL = 60
-
     while True:
-        _draw_main_menu(REFRESH_INTERVAL)
-        choice = _wait_with_countdown(REFRESH_INTERVAL)
+        header()
+        status_line()
 
-        if choice is None:
-            continue
+        if RICH:
+            console.print("  [bold]Main Menu[/bold]\n")
+            for k, label in [
+                ("1", "Archive a dataset"),
+                ("2", "Restore a dataset"),
+                ("3", "Verify archives"),
+                ("4", "Browse inventory & search"),
+                ("5", "Tape management  (mount / unmount / format)"),
+                ("6", "Jobs  (background archive / restore / verify)"),
+                ("7", "Library / changer management"),
+                ("q", "Quit"),
+            ]:
+                console.print("  [cyan]{}[/cyan][dim])[/dim]  {}".format(k, label))
+            console.print()
+        else:
+            print("  Main Menu\n")
+            for k, l in [("1","Archive a dataset"),("2","Restore a dataset"),
+                          ("3","Verify archives"),("4","Browse inventory & search"),
+                          ("5","Tape management (mount / unmount / format)"),
+                          ("6","Jobs (background archive/restore/verify)"),
+                          ("7","Library / changer management"),("q","Quit")]:
+                print("  {})  {}".format(k, l))
+            print()
+
+        choice = prompt("Enter choice  [dim](status refreshes every 60s — press Enter to refresh now)[/dim]"
+                        if RICH else
+                        "Enter choice (press Enter to refresh status)")
+
+        if not choice:
+            continue  # blank Enter — refresh status
 
         if choice == "1":
             do_archive()

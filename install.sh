@@ -21,11 +21,24 @@ echo "Creating directories..."
 mkdir -p /usr/local/lib/tapeman2
 mkdir -p /etc/tapeman2
 mkdir -p /var/lib/tapeman2
+mkdir -p /var/lib/tapeman2/jobs
 mkdir -p /var/log/tapeman2
 mkdir -p /data/staging
 mkdir -p /data/restore
 mkdir -p /mnt/tape
 chmod 777 /mnt/tape
+
+# Enable FUSE allow_other so any user can access a tape mounted by another
+# user (or root). Required for multi-user LTFS access.
+if [ -f /etc/fuse.conf ]; then
+    if ! grep -q '^user_allow_other' /etc/fuse.conf; then
+        echo "user_allow_other" >> /etc/fuse.conf
+        echo "  Enabled user_allow_other in /etc/fuse.conf"
+    fi
+else
+    echo "user_allow_other" > /etc/fuse.conf
+    echo "  Created /etc/fuse.conf with user_allow_other"
+fi
 
 # Ensure tape group exists
 if ! getent group tape &>/dev/null; then
@@ -37,14 +50,19 @@ fi
 chown root:root /etc/tapeman2
 chmod 755       /etc/tapeman2
 
-# State/log/staging dirs writable by tape group
-chown root:tape /var/log/tapeman2 /var/lib/tapeman2 /data/staging /data/restore
-chmod 775       /var/log/tapeman2 /var/lib/tapeman2 /data/staging /data/restore
+# State/log/staging dirs world-writable so any user can run tapeman2
+# (matches the world-accessible tape device policy — no per-user setup needed)
+chmod 1777      /var/lib/tapeman2 /var/lib/tapeman2/jobs /data/staging /data/restore
+chmod 1777      /var/log/tapeman2
 
-# Pre-create log file with correct permissions so non-root users can write to it
+# Pre-create log file world-writable so non-root users can write to it
 touch /var/log/tapeman2/tapeman2.log
-chown root:tape /var/log/tapeman2/tapeman2.log
-chmod 664       /var/log/tapeman2/tapeman2.log
+chmod 666       /var/log/tapeman2/tapeman2.log
+
+# Make existing database writable by all (if present)
+if [ -f /var/lib/tapeman2/archives.db ]; then
+    chmod 666 /var/lib/tapeman2/archives.db
+fi
 
 # ── System packages ───────────────────────────────────────────────────────────
 echo "Installing system packages..."

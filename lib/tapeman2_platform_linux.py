@@ -56,22 +56,6 @@ def is_mounted(mount_point):
     result = run_cmd(["mountpoint", "-q", mount_point])
     return result.returncode == 0
 
-def mount_tape(sg_device, mount_point, progress_cb=None):
-    from pathlib import Path
-    Path(mount_point).mkdir(parents=True, exist_ok=True)
-    if is_mounted(mount_point):
-        return
-    load_fuse()
-    if progress_cb:
-        progress_cb("Mounting tape...")
-    result = run_cmd(
-        ["ltfs", "-o", "devname={}".format(sg_device), mount_point],
-        timeout=120
-    )
-    if not is_mounted(mount_point):
-        raise RuntimeError("Failed to mount tape:\n{}\n{}".format(
-            result.stderr, result.stdout))
-
 def unmount_tape(mount_point, progress_cb=None):
     if not is_mounted(mount_point):
         return
@@ -246,7 +230,8 @@ def mount_tape(sg_device, mount_point, progress_cb=None, st_device=None):
     import time as _time
 
     proc = _sp.Popen(
-        ["ltfs", "-o", "devname={}".format(sg_device), mount_point],
+        ["ltfs", "-o", "devname={}".format(sg_device),
+         "-o", "allow_other", mount_point],
         stdout=_sp.PIPE, stderr=_sp.PIPE, universal_newlines=True)
 
     # Poll for up to 5 minutes for the mount to come up

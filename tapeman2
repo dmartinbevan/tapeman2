@@ -427,17 +427,28 @@ def _format_tape():
         return
 
     if RICH:
-        console.print("  [red bold]WARNING: This will ERASE ALL DATA on the tape.[/red bold]\n")
+        console.print("  [bold red]WARNING: This will ERASE ALL DATA on the tape.[/bold red]\n")
+        console.print(
+            "  LTFS requires a [bold]6-character alphanumeric serial[/bold] (e.g. [cyan]LAB001[/cyan]).\n"
+            "  You can also give the tape a longer descriptive volume name.\n")
     else:
         print("  WARNING: This will ERASE ALL DATA on the tape.\n")
+        print("  LTFS tape serial must be exactly 6 alphanumeric characters (e.g. LAB001).\n")
 
-    label = prompt("Enter tape label (e.g. CRYO-2025-A)").upper().replace(" ", "")
-    if not label:
-        warn("Label cannot be empty.")
+    serial = prompt("Tape serial (6 chars, letters/numbers only, e.g. LAB001)").upper().strip()
+    serial = "".join(c for c in serial if c.isalnum())[:6]
+    if len(serial) != 6:
+        error("Serial must be exactly 6 alphanumeric characters. Got: '{}'".format(serial))
         pause()
         return
 
-    confirm_str = input(f"\n  Type YES to confirm formatting tape '{label}': ").strip()
+    volume_name = prompt(
+        "Volume name (optional longer description, e.g. Calero-Lab-Tape-1)",
+        default=serial
+    ).strip()
+
+    confirm_str = input("\n  Type YES to confirm formatting tape '{}' ({}): ".format(
+        serial, volume_name)).strip()
     if confirm_str != "YES":
         warn("Format cancelled.")
         pause()
@@ -448,13 +459,13 @@ def _format_tape():
     print()
 
     try:
-        core.format_tape(SG, label, progress_cb=progress_msg)
-        info(f"Tape '{label}' formatted successfully.")
-        core.add_tape(DB, label)
-        info(f"Tape '{label}' registered in database.")
+        core.format_tape(SG, serial, volume_name=volume_name, progress_cb=progress_msg)
+        info("Tape '{}' ({}) formatted successfully.".format(serial, volume_name))
+        core.add_tape(DB, serial)
+        info("Tape '{}' registered in database.".format(serial))
         if confirm("Mount the tape now?"):
             core.mount_tape(SG, MOUNT, progress_cb=progress_msg, st_device=ST)
-            info(f"Tape mounted at {MOUNT}")
+            info("Tape mounted at {}".format(MOUNT))
     except core.TapeError as e:
         error(str(e))
     pause()

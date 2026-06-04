@@ -306,10 +306,29 @@ def unmount_tape(mount_point, progress_cb=None):
 def eject_tape(st_device):
     _get_platform().eject_tape(st_device)
 
-def format_tape(sg_device, label, progress_cb=None):
+def format_tape(sg_device, serial, volume_name="", progress_cb=None):
+    """
+    Format a tape with LTFS.
+    serial      — exactly 6 alphanumeric characters (LTFS requirement)
+    volume_name — optional longer descriptive name (stored in LTFS label)
+    """
+    # Validate serial
+    import re
+    serial = serial.upper().strip()
+    if not re.match(r'^[A-Z0-9]{6}$', serial):
+        raise TapeError(
+            "Tape serial must be exactly 6 alphanumeric characters (e.g. LAB001).\n"
+            "Got: '{}'".format(serial))
+
     if progress_cb:
-        progress_cb("Formatting tape '{}' — this may take several minutes...".format(label))
-    result = run_cmd(["mkltfs", "-d", sg_device, "-s", label], timeout=3600)
+        progress_cb("Formatting tape serial='{}' name='{}' — this may take several minutes...".format(
+            serial, volume_name or serial))
+
+    cmd = ["mkltfs", "-d", sg_device, "-s", serial]
+    if volume_name:
+        cmd += ["-n", volume_name]
+
+    result = run_cmd(cmd, timeout=3600)
     if "succeeded" not in result.stdout and "succeeded" not in result.stderr:
         raise TapeError("Format failed:\n{}{}".format(result.stdout, result.stderr))
 

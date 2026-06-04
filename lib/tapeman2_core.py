@@ -13,6 +13,7 @@ import os
 import platform
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -194,6 +195,29 @@ CREATE TABLE IF NOT EXISTS changer_log (
     result          TEXT,
     notes           TEXT
 );
+
+CREATE TABLE IF NOT EXISTS file_manifest (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    archive_id      TEXT    NOT NULL,
+    tape_label      TEXT    NOT NULL,
+    file_path       TEXT    NOT NULL,
+    size_bytes      INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS tape_health (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tape_label      TEXT    NOT NULL,
+    timestamp       TEXT    NOT NULL,
+    operation       TEXT,
+    write_errors    INTEGER DEFAULT 0,
+    read_errors     INTEGER DEFAULT 0,
+    notes           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_manifest_path
+    ON file_manifest(file_path);
+CREATE INDEX IF NOT EXISTS idx_manifest_archive
+    ON file_manifest(archive_id);
 """
 
 @contextmanager
@@ -228,6 +252,21 @@ def init_db(db_path):
                     slot INTEGER, drive INTEGER, tape_label TEXT,
                     result TEXT, notes TEXT
                 );
+                CREATE TABLE IF NOT EXISTS file_manifest (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    archive_id TEXT NOT NULL, tape_label TEXT NOT NULL,
+                    file_path TEXT NOT NULL, size_bytes INTEGER
+                );
+                CREATE TABLE IF NOT EXISTS tape_health (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    tape_label TEXT NOT NULL, timestamp TEXT NOT NULL,
+                    operation TEXT, write_errors INTEGER DEFAULT 0,
+                    read_errors INTEGER DEFAULT 0, notes TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_manifest_path
+                    ON file_manifest(file_path);
+                CREATE INDEX IF NOT EXISTS idx_manifest_archive
+                    ON file_manifest(archive_id);
             """)
         except Exception:
             pass
@@ -921,6 +960,22 @@ def archive_dataset(
         _db_upsert_tape(db_path, tape_label, size_bytes)
         _db_insert_archive(db_path, record)
         progress("✔ Archive {} logged to database.".format(archive_id))
+
+        # Record file manifest for filename search / single-file restore
+        try:
+            manifest_base = os.path.join(mount_point, archive_id)
+            n = record_manifest(db_path, archive_id, tape_label, manifest_base)
+            if n:
+                progress("Recorded {} files in manifest.".format(n))
+        except Exception as e:
+            progress("Manifest recording skipped: {}".format(e))
+
+        # Snapshot tape health (drive error counters)
+        try:
+            record_tape_health(db_path, tape_label, "archive", sg_device)
+        except Exception:
+            pass
+
         return record
 
     finally:
@@ -1148,6 +1203,193 @@ def list_tapes(db_path):
         rows = conn.execute(
             "SELECT * FROM tapes ORDER BY date_first_used DESC").fetchall()
     return [_row_to_tape(r) for r in rows]
+
+# ── Capacity Check ────────────────────────────────────────────────────────────
+
+def check_capacity(source_path, mount_point, warn_threshold=0.90):
+    """
+    Check whether source will fit on the mounted tape.
+    Returns dict: {fits, source_bytes, tape_free, tape_total,
+                   pct_after, warning}
+    """
+    src_size, _ = dir_size_and_count(source_path)
+    if not is_mounted(mount_point):
+        return {"fits": False, "source_bytes": src_size, "tape_free": 0,
+                "tape_total": 0, "pct_after": 0,
+                "warning": "Tape not mounted."}
+
+    free  = tape_free_bytes(mount_point)
+    total = tape_total_bytes(mount_point)
+    fits  = src_size < free
+    used_after = (total - free) + src_size
+    pct_after  = (used_after / total) if total else 0
+
+    warning = None
+    if not fits:
+        warning = ("Source ({}) will NOT fit — only {} free.".format(
+            human_size(src_size), human_size(free)))
+    elif pct_after >= warn_threshold:
+        warning = ("Tape will be {:.0f}% full after this archive.".format(
+            pct_after * 100))
+
+    return {"fits": fits, "source_bytes": src_size, "tape_free": free,
+            "tape_total": total, "pct_after": pct_after, "warning": warning}
+
+# ── File Manifest (filename search / restore) ─────────────────────────────────
+
+def record_manifest(db_path, archive_id, tape_label, base_path):
+    """
+    Walk an archived directory and record every file in the manifest table.
+    Enables search-by-filename and single-file restore.
+    """
+    entries = []
+    if os.path.isdir(base_path):
+        for root, _dirs, files in os.walk(base_path):
+            for fn in files:
+                full = os.path.join(root, fn)
+                rel  = os.path.relpath(full, base_path)
+                try:
+                    sz = os.path.getsize(full)
+                except OSError:
+                    sz = 0
+                entries.append((archive_id, tape_label, rel, sz))
+    else:
+        entries.append((archive_id, tape_label,
+                        os.path.basename(base_path),
+                        os.path.getsize(base_path) if os.path.exists(base_path) else 0))
+
+    if entries:
+        with get_db(db_path) as conn:
+            conn.executemany(
+                "INSERT INTO file_manifest "
+                "(archive_id, tape_label, file_path, size_bytes) "
+                "VALUES (?,?,?,?)", entries)
+    return len(entries)
+
+def search_files(db_path, pattern):
+    """
+    Search the file manifest by filename pattern.
+    Returns list of dicts: {archive_id, tape_label, file_path, size_bytes}
+    """
+    like = "%{}%".format(pattern)
+    with get_db(db_path) as conn:
+        rows = conn.execute(
+            "SELECT archive_id, tape_label, file_path, size_bytes "
+            "FROM file_manifest WHERE file_path LIKE ? "
+            "ORDER BY archive_id, file_path LIMIT 500", (like,)).fetchall()
+    return [dict(r) for r in rows]
+
+def get_archive_files(db_path, archive_id):
+    """Return all files recorded for an archive."""
+    with get_db(db_path) as conn:
+        rows = conn.execute(
+            "SELECT file_path, size_bytes FROM file_manifest "
+            "WHERE archive_id=? ORDER BY file_path", (archive_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+# ── Email Notifications ───────────────────────────────────────────────────────
+
+def send_email(to_addr, subject, body, cfg=None):
+    """
+    Send an email notification via the local 'mail' command (uses system MTA).
+    Returns (success, message). Silently no-ops if to_addr is empty.
+    """
+    if not to_addr:
+        return False, "No recipient configured."
+    try:
+        proc = subprocess.run(
+            ["mail", "-s", subject, to_addr],
+            input=body, universal_newlines=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if proc.returncode == 0:
+            return True, "Email sent to {}".format(to_addr)
+        return False, "mail command failed: {}".format(proc.stderr)
+    except FileNotFoundError:
+        return False, "'mail' command not found — install mailx."
+    except Exception as e:
+        return False, "Email error: {}".format(e)
+
+def notify_job_complete(cfg, job):
+    """Send completion email if notifications are configured."""
+    if not cfg:
+        return
+    try:
+        to_addr = cfg.get("notify", "email", fallback="").strip()
+    except Exception:
+        to_addr = ""
+    if not to_addr:
+        return
+
+    status  = job.get("status", "unknown")
+    jtype   = job.get("type", "job")
+    jobid   = job.get("job_id", "")
+    name    = job.get("name") or job.get("archive_id") or ""
+
+    subject = "[tapeman2] {} {} — {}".format(jtype, jobid, status)
+    body = (
+        "tapeman2 job notification\n"
+        "-------------------------\n"
+        "Job ID:    {}\n"
+        "Type:      {}\n"
+        "Name:      {}\n"
+        "Status:    {}\n"
+        "Started:   {}\n"
+        "Finished:  {}\n".format(
+            jobid, jtype, name, status,
+            job.get("started", ""), job.get("finished", "")))
+    if job.get("archive_id"):
+        body += "Archive:   {}\n".format(job["archive_id"])
+    if job.get("error"):
+        body += "\nError:\n{}\n".format(job["error"])
+    body += "\n-- \ntapeman2 on {}\n".format(socket.gethostname())
+
+    send_email(to_addr, subject, body, cfg)
+
+# ── Tape Health ───────────────────────────────────────────────────────────────
+
+def record_tape_health(db_path, tape_label, operation="", sg_device=""):
+    """
+    Read drive error counters and record a health snapshot for this tape.
+    """
+    write_err, read_err = 0, 0
+    plat = _get_platform()
+    if sg_device and hasattr(plat, "read_error_counters"):
+        try:
+            write_err, read_err = plat.read_error_counters(sg_device)
+        except Exception:
+            pass
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db(db_path) as conn:
+        conn.execute(
+            "INSERT INTO tape_health "
+            "(tape_label, timestamp, operation, write_errors, read_errors) "
+            "VALUES (?,?,?,?,?)",
+            (tape_label, now, operation, write_err, read_err))
+    return write_err, read_err
+
+def get_tape_health(db_path, tape_label=None):
+    """
+    Return health history. If tape_label given, just that tape.
+    Otherwise a summary per tape (latest snapshot + totals).
+    """
+    with get_db(db_path) as conn:
+        if tape_label:
+            rows = conn.execute(
+                "SELECT * FROM tape_health WHERE tape_label=? "
+                "ORDER BY timestamp DESC", (tape_label,)).fetchall()
+            return [dict(r) for r in rows]
+        else:
+            # Summary: per tape, sum errors and latest timestamp
+            rows = conn.execute(
+                "SELECT tape_label, "
+                "  COUNT(*) AS snapshots, "
+                "  SUM(write_errors) AS total_write_errors, "
+                "  SUM(read_errors) AS total_read_errors, "
+                "  MAX(timestamp) AS last_check "
+                "FROM tape_health GROUP BY tape_label "
+                "ORDER BY total_write_errors DESC").fetchall()
+            return [dict(r) for r in rows]
 
 def get_tape(db_path, label):
     with get_db(db_path) as conn:
@@ -1392,6 +1634,144 @@ def cleanup_jobs(state_dir, keep_days=7):
 def active_job_count(state_dir):
     return len(list_jobs(state_dir, status=JOB_STATUS_RUNNING))
 
+# ── Job Queue (sequential execution) ──────────────────────────────────────────
+
+def _queue_file(state_dir):
+    return os.path.join(_jobs_dir(state_dir), "_queue.json")
+
+def enqueue_job(state_dir, job_spec):
+    """
+    Add a job spec to the sequential queue. job_spec is a dict describing
+    the job (type + parameters). Returns the queue position.
+    """
+    qfile = _queue_file(state_dir)
+    queue = []
+    if os.path.exists(qfile):
+        try:
+            with open(qfile) as f:
+                queue = json.load(f)
+        except Exception:
+            queue = []
+    job_spec["queued_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    queue.append(job_spec)
+    tmp = qfile + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(queue, f, indent=2)
+    os.replace(tmp, qfile)
+    return len(queue)
+
+def get_queue(state_dir):
+    qfile = _queue_file(state_dir)
+    if not os.path.exists(qfile):
+        return []
+    try:
+        with open(qfile) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def clear_queue(state_dir):
+    qfile = _queue_file(state_dir)
+    if os.path.exists(qfile):
+        os.remove(qfile)
+
+def process_queue(state_dir, db_path, cfg, sg_device="", st_device="",
+                  staging_dir="", mount_point="", checksum_algo="sha256"):
+    """
+    Process queued jobs sequentially. Designed to run as a single background
+    daemon: it pops jobs one at a time and runs them to completion in order.
+    Returns immediately after forking the queue processor.
+    """
+    queue = get_queue(state_dir)
+    if not queue:
+        return None
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setsid()
+        except Exception:
+            pass
+        devnull = open(os.devnull, "r+")
+        os.dup2(devnull.fileno(), 0)
+        os.dup2(devnull.fileno(), 1)
+        os.dup2(devnull.fileno(), 2)
+
+        # Process each queued job in order, synchronously
+        while True:
+            queue = get_queue(state_dir)
+            if not queue:
+                break
+            spec = queue[0]
+
+            job_id = _next_job_id(state_dir)
+            now    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            job = {
+                "job_id": job_id, "type": spec.get("type", "archive"),
+                "status": JOB_STATUS_RUNNING, "name": spec.get("name", ""),
+                "tape_label": spec.get("tape_label", ""),
+                "source_path": spec.get("source_path", ""),
+                "archive_id": spec.get("archive_id"),
+                "pid": os.getpid(), "progress": "Starting (from queue)...",
+                "percent": 0, "started": now, "finished": None, "error": None,
+                "from_queue": True,
+            }
+            _write_job(state_dir, job)
+
+            def progress_cb(msg, _jid=job_id):
+                jj = _read_job(_job_file(state_dir, _jid)) or {}
+                jj["progress"] = msg
+                jj["status"]   = JOB_STATUS_RUNNING
+                _write_job(state_dir, jj)
+
+            try:
+                if spec["type"] == "archive":
+                    rec = archive_dataset(
+                        source_path=spec["source_path"], name=spec["name"],
+                        tape_label=spec["tape_label"], db_path=db_path,
+                        staging_dir=staging_dir, mount_point=mount_point,
+                        checksum_algo=checksum_algo,
+                        use_tar=spec.get("use_tar", False),
+                        lab=spec.get("lab", ""), pi=spec.get("pi", ""),
+                        notes=spec.get("notes", ""),
+                        progress_cb=progress_cb, dry_run=False, cfg=cfg,
+                        sg_device=sg_device, st_device=st_device,
+                        direct_write=spec.get("direct_write", False))
+                    jj = _read_job(_job_file(state_dir, job_id))
+                    jj["status"] = JOB_STATUS_COMPLETE
+                    jj["archive_id"] = rec.archive_id
+                    jj["progress"] = "Complete — {}".format(rec.archive_id)
+                    jj["percent"] = 100
+                    jj["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    _write_job(state_dir, jj)
+                    notify_job_complete(cfg, jj)
+            except Exception as e:
+                jj = _read_job(_job_file(state_dir, job_id)) or job
+                jj["status"] = JOB_STATUS_FAILED
+                jj["error"] = str(e)
+                jj["progress"] = "Failed: {}".format(str(e)[:80])
+                jj["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                _write_job(state_dir, jj)
+                notify_job_complete(cfg, jj)
+
+            # Remove the completed job from the queue
+            queue = get_queue(state_dir)
+            if queue:
+                queue.pop(0)
+                qfile = _queue_file(state_dir)
+                tmp = qfile + ".tmp"
+                with open(tmp, "w") as f:
+                    json.dump(queue, f, indent=2)
+                os.replace(tmp, qfile)
+
+        os._exit(0)
+    else:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except Exception:
+            pass
+        return pid
+
 def submit_archive_job(
     state_dir, db_path, source_path, name, tape_label,
     staging_dir, mount_point, checksum_algo="sha256",
@@ -1482,6 +1862,7 @@ def submit_archive_job(
             j["percent"]    = 100
             j["finished"]   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _write_job(state_dir, j)
+            notify_job_complete(cfg, j)
         except Exception as e:
             j = _read_job(_job_file(state_dir, job_id)) or job.copy()
             j["status"]   = JOB_STATUS_FAILED
@@ -1489,6 +1870,7 @@ def submit_archive_job(
             j["progress"] = "Failed: {}".format(str(e)[:80])
             j["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _write_job(state_dir, j)
+            notify_job_complete(cfg, j)
         finally:
             os._exit(0)
     else:
@@ -1569,6 +1951,7 @@ def submit_restore_job(
             if not ok:
                 j["error"] = "Checksum mismatch after restore"
             _write_job(state_dir, j)
+            notify_job_complete(cfg, j)
         except Exception as e:
             j = _read_job(_job_file(state_dir, job_id)) or job.copy()
             j["status"]   = JOB_STATUS_FAILED
@@ -1576,6 +1959,7 @@ def submit_restore_job(
             j["progress"] = "Failed: {}".format(str(e)[:80])
             j["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             _write_job(state_dir, j)
+            notify_job_complete(cfg, j)
         finally:
             os._exit(0)
     else:

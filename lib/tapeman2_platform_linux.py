@@ -211,6 +211,34 @@ def mount_tape(sg_device, mount_point, progress_cb=None, st_device=None):
         raise RuntimeError("Failed to mount tape:\n{}\n{}".format(
             result.stderr, result.stdout))
 
+# ── Error Counters (tape health) ──────────────────────────────────────────────
+
+def read_error_counters(sg_device):
+    """
+    Read write/read error counters from SCSI log pages.
+    Page 0x02 = write errors, Page 0x03 = read errors.
+    Returns (write_errors, read_errors). Returns (0,0) if unavailable.
+    """
+    def _sum_page(page):
+        result = run_cmd(["sg_logs", "-p", page, sg_device], timeout=10)
+        if result.returncode != 0:
+            return 0
+        total = 0
+        for line in result.stdout.splitlines():
+            low = line.lower()
+            if "total" in low and "corrected" in low:
+                m = re.search(r"=\s*(\d+)", line)
+                if m:
+                    total = max(total, int(m.group(1)))
+        return total
+
+    try:
+        return _sum_page("0x02"), _sum_page("0x03")
+    except Exception:
+        return 0, 0
+
+# ── Cleaning Detection ────────────────────────────────────────────────────────
+
 # TapeAlert log page (0x2e) flag meanings we care about
 _TAPEALERT_CLEAN_FLAGS = {
     "20": "Clean now",

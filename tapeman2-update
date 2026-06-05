@@ -6,7 +6,12 @@ set -e
 
 REPO_DIR="/usr/local/src/tapeman2"
 REPO_URL="https://github.com/dmartinbevan/tapeman2.git"
-INSTALL_SCRIPT="install.sh"
+# Pick the right installer for this OS
+if [ "$(uname -s)" = "Darwin" ]; then
+    INSTALL_SCRIPT="install-mac.sh"
+else
+    INSTALL_SCRIPT="install.sh"
+fi
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 GREEN='\033[0;32m'
@@ -101,7 +106,7 @@ step "Running installer..."
 cd "$REPO_DIR"
 
 if [ ! -f "$INSTALL_SCRIPT" ]; then
-    error "install.sh not found in $REPO_DIR"
+    error "$INSTALL_SCRIPT not found in $REPO_DIR"
     exit 1
 fi
 

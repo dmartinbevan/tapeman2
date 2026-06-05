@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""
+tapeman2-setup — macOS configuration wizard for tapeman2
+"""
+
+import os
+import sys
+import subprocess
+import configparser
+from pathlib import Path
+
+CONFIG_PATH = "/usr/local/etc/tapeman2/tapeman2.conf"
+LIB_PATH    = "/usr/local/lib/tapeman2"
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.prompt import Prompt, Confirm
+    from rich.table import Table
+    from rich import box
+    RICH = True
+    console = Console()
+except ImportError:
+    RICH = False
+    class _Con:
+        def print(self, *a, **k):
+            import re
+            print(re.sub(r"\[.*?\]", "", " ".join(str(x) for x in a)))
+        def rule(self, t=""):
+            print("\n" + "─"*60 + ("  " + t if t else "") + "\n")
+    console = _Con()
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def clear():
+    os.system("clear")
+
+def header(sub=""):
+    clear()
+    if RICH:
+        console.print(Panel.fit(
+            "[bold cyan]TapeMan 2[/bold cyan]  [dim]macOS Configuration Wizard[/dim]"
+            + ("\n[dim]{}[/dim]".format(sub) if sub else ""),
+            border_style="cyan"
+        ))
+    else:
+        print("=" * 60)
+        print("  TapeMan 2 — macOS Configuration Wizard")
+        if sub:
+            print("  " + sub)
+        print("=" * 60)
+    print()
+
+def info(msg):
+    if RICH:
+        console.print("  [green]✔[/green]  " + msg)
+    else:
+        print("  ✔  " + msg)
+
+def warn(msg):
+    if RICH:
+        console.print("  [yellow]⚠[/yellow]  " + msg)
+    else:
+        print("  ⚠  " + msg)
+
+def error(msg):
+    if RICH:
+        console.print("  [red]✘[/red]  " + msg)
+    else:
+        print("  ✘  " + msg)
+
+def prompt(msg, default=""):
+    if RICH:
+        return Prompt.ask("  [cyan]{}[/cyan]".format(msg), default=default)
+    else:
+        d = " [{}]".format(default) if default else ""
+        val = input("  {}{}: ".format(msg, d)).strip()
+        return val if val else default
+
+def confirm(msg, default=True):
+    if RICH:
+        return Confirm.ask("  [cyan]{}[/cyan]".format(msg), default=default)
+    else:
+        d = "Y/n" if default else "y/N"
+        val = input("  {} [{}]: ".format(msg, d)).strip().lower()
+        return default if not val else val.startswith("y")
+
+def pause():
+    input("\n  Press Enter to continue...")
+
+def run(cmd):
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             universal_newlines=True)
+    return result.stdout.strip(), result.stderr.strip(), result.returncode
+
+def tool_ok(name):
+    _, _, rc = run(["which", name])
+    return rc == 0
+
+# ── Steps ─────────────────────────────────────────────────────────────────────
+
+def step_welcome():
+    header()
+    if RICH:
+        console.print(
+            "  Welcome to the [bold cyan]TapeMan 2[/bold cyan] macOS setup wizard.\n\n"
+            "  This will configure tapeman2 for a Mac with a locally\n"
+            "  connected SAS tape drive or library.\n\n"
+            "  Requirements:\n"
+            "  • macFUSE\n"
+            "  • IBM Spectrum Archive SDE or HPE StoreOpen (LTFS)\n"
+            "  • SAS HBA with vendor driver installed\n"
+            "  • mtx (brew install mtx) — for library/changer support\n"
+        )
+    else:
+        print("  TapeMan 2 macOS setup wizard.\n")
+        print("  Requires: macFUSE, LTFS (IBM/HPE), SAS HBA driver\n")
+
+    if Path(CONFIG_PATH).exists():
+        warn("Existing config found at {}".format(CONFIG_PATH))
+        if not confirm("Overwrite?", default=False):
+            info("Keeping existing config. Exiting.")
+            sys.exit(0)
+
+    if not confirm("Continue?"):
+        sys.exit(0)
+
+def step_check_tools():
+    header("Step 1 — Checking Tools")
+
+    # Check macFUSE
+    macfuse_paths = [
+        "/Library/Filesystems/macfuse.fs",
+        "/Library/Extensions/macfuse.kext",
+        "/usr/local/lib/libfuse.dylib",
+    ]
+    macfuse_ok = any(os.path.exists(p) for p in macfuse_paths)
+
+    tools = [
+        ("macFUSE",  macfuse_ok,       "FUSE filesystem support",
+         "brew install --cask macfuse\n     OR: https://github.com/osxfuse/osxfuse/releases"),
+        ("ltfs",     tool_ok("ltfs"),   "LTFS filesystem tool",
+         "Download IBM Spectrum Archive SDE for Mac:\n"
+         "     https://www.ibm.com/support/pages/ibm-spectrum-archive-single-drive-edition"),
+        ("mkltfs",   tool_ok("mkltfs"),"LTFS format utility",         "Included with LTFS package"),
+        ("mt",       tool_ok("mt"),     "Tape control",                "brew install cdrtools"),
+        ("mtx",      tool_ok("mtx"),    "Media changer (optional)",    "brew install mtx"),
+        ("rsync",    tool_ok("rsync"),  "File sync",                   "brew install rsync"),
+    ]
+
+    if RICH:
+        t = Table(box=box.SIMPLE_HEAVY)
+        t.add_column("Tool")
+        t.add_column("Status")
+        t.add_column("Description")
+        for name, ok, desc, _ in tools:
+            status = "[green]✔ OK[/green]" if ok else "[red]✘ missing[/red]"
+            t.add_row(name, status, desc)
+        console.print(t)
+    else:
+        for name, ok, desc, _ in tools:
+            print("  {:12} {:10} {}".format(name, "OK" if ok else "MISSING", desc))
+
+    missing_required = [(n, i) for n, ok, _, i in tools
+                        if not ok and n in ("macFUSE", "ltfs", "mkltfs", "rsync")]
+
+    if missing_required:
+        print()
+        error("Required components are missing:\n")
+        for name, install in missing_required:
+            if RICH:
+                console.print("  [bold yellow]{}[/bold yellow]".format(name))
+                console.print("  [dim]Install:[/dim] {}\n".format(install))
+            else:
+                print("  {}\n  Install: {}\n".format(name, install))
+
+        if RICH:
+            console.print(
+                "  [dim]After installing, re-run:[/dim] [cyan]tapeman2-setup[/cyan]"
+            )
+        else:
+            print("  After installing, re-run: tapeman2-setup")
+
+        pause()
+        sys.exit(1)
+
+    missing_optional = [(n, i) for n, ok, _, i in tools
+                        if not ok and n not in ("macFUSE", "ltfs", "mkltfs", "rsync")]
+    if missing_optional:
+        print()
+        warn("Optional tools missing (only needed for library/changer):")
+        for name, install in missing_optional:
+            if RICH:
+                console.print("  [dim]  {} — {}[/dim]".format(name, install))
+            else:
+                print("  {} — {}".format(name, install))
+
+    print()
+    info("Required tools OK.")
+    pause()
+
+def step_detect_devices():
+    header("Step 2 — Detecting Devices")
+
+    sys.path.insert(0, LIB_PATH)
+    try:
+        import tapeman2_platform_mac as plat
+        info("Scanning for tape drives...")
+        drives   = plat.detect_tape_drives()
+        changers = plat.detect_changers()
+    except Exception as e:
+        warn("Device detection failed: {}".format(e))
+        drives, changers = [], []
+
+    print()
+    if drives:
+        if RICH:
+            t = Table(box=box.SIMPLE_HEAVY, title="Tape Drives")
+            t.add_column("#"); t.add_column("SG"); t.add_column("ST"); t.add_column("Model")
+            for i, d in enumerate(drives):
+                t.add_row(str(i), d["sg"], d["nst"], d["model"])
+            console.print(t)
+        else:
+            print("  Tape Drives:")
+            for i, d in enumerate(drives):
+                print("  {}  {}  {}  {}".format(i, d["sg"], d["nst"], d["model"]))
+    else:
+        warn("No tape drives detected.")
+        if RICH:
+            console.print(
+                "\n  [dim]Possible reasons:\n"
+                "  • SAS HBA driver not installed or not loaded\n"
+                "  • Drive not powered on\n"
+                "  • Cable not connected\n"
+                "  • Try: system_profiler SPSASDataType[/dim]"
+            )
+        else:
+            print("\n  Check: SAS HBA driver, power, cables.")
+            print("  Try: system_profiler SPSASDataType")
+
+    print()
+    if changers:
+        if RICH:
+            t = Table(box=box.SIMPLE_HEAVY, title="Media Changers")
+            t.add_column("#"); t.add_column("Device"); t.add_column("Model")
+            for i, c in enumerate(changers):
+                t.add_row(str(i), c["sg"], c["model"])
+            console.print(t)
+        else:
+            print("  Changers:")
+            for i, c in enumerate(changers):
+                print("  {}  {}  {}".format(i, c["sg"], c["model"]))
+    else:
+        info("No media changers detected (single-drive mode).")
+
+    if not drives:
+        print()
+        if not confirm("No drives found. Configure manually and continue?", default=False):
+            sys.exit(1)
+
+    pause()
+    return drives, changers
+
+def step_configure_drive(drives, cfg):
+    header("Step 3 — Configure Tape Drive")
+
+    if drives:
+        if len(drives) == 1:
+            d = drives[0]
+            info("Using: {} ({})".format(d["sg"], d["model"]))
+            sg, st = d["sg"], d["nst"]
+        else:
+            for i, d in enumerate(drives):
+                print("  {})  {} — {}".format(i, d["sg"], d["model"]))
+            choice = prompt("Drive number", default="0")
+            try:
+                d = drives[int(choice)]
+            except (ValueError, IndexError):
+                d = drives[0]
+            sg, st = d["sg"], d["nst"]
+    else:
+        sg = prompt("SG device path", default="/dev/sg0")
+        st = prompt("ST device (no-rewind)", default="/dev/nrmt0")
+
+    mount = prompt("Tape mount point", default="/Volumes/tape")
+
+    cfg.set("device", "sg_device",   sg)
+    cfg.set("device", "st_device",   st)
+    cfg.set("device", "mount_point", mount)
+
+    info("Drive: {}  Mount: {}".format(sg, mount))
+    pause()
+
+def step_configure_paths(cfg):
+    header("Step 4 — Configure Paths")
+
+    staging = prompt("Staging directory", default="/usr/local/var/tapeman2/staging")
+    restore = prompt("Restore directory",  default="/usr/local/var/tapeman2/restore")
+    state   = prompt("State directory",    default="/usr/local/var/tapeman2")
+    log     = prompt("Log file",           default="/usr/local/var/log/tapeman2/tapeman2.log")
+
+    if os.path.exists(staging):
+        import shutil
+        free_gb = shutil.disk_usage(staging).free / 1024**3
+        if free_gb < 100:
+            warn("Staging only has {:.0f} GB free.".format(free_gb))
+        else:
+            info("Staging: {:.0f} GB free.".format(free_gb))
+
+    cfg.set("paths", "staging_dir", staging)
+    cfg.set("paths", "restore_dir", restore)
+    cfg.set("paths", "state_dir",   state)
+    cfg.set("paths", "db_path",     "{}/archives.db".format(state))
+    cfg.set("paths", "log_file",    log)
+    pause()
+
+def step_configure_archive(cfg):
+    header("Step 5 — Archive Settings")
+
+    algo    = prompt("Checksum algorithm (sha256/md5)", default="sha256")
+    tar_def = confirm("Bundle small-file datasets as tar by default?", default=False)
+    min_stg = prompt("Minimum staging free space (GB)", default="50")
+    blksz   = prompt("LTFS block size (bytes)", default="524288")
+
+    cfg.set("archive", "checksum_algo",       algo)
+    cfg.set("archive", "tar_by_default",      "true" if tar_def else "false")
+    cfg.set("archive", "min_staging_free_gb", min_stg)
+    cfg.set("archive", "ltfs_blocksize",      blksz)
+    pause()
+
+def step_configure_changer(drives, changers, cfg):
+    header("Step 6 — Library / Changer")
+
+    if not changers and len(drives) <= 1:
+        info("Single drive mode — no changer.")
+        cfg.set("changer", "enabled", "false")
+        pause()
+        return
+
+    enable = confirm("Enable library/changer support?", default=bool(changers))
+    if not enable:
+        cfg.set("changer", "enabled", "false")
+        pause()
+        return
+
+    if not tool_ok("mtx"):
+        warn("mtx not found.")
+        if confirm("Install mtx via brew?", default=True):
+            os.system("brew install mtx")
+            if not tool_ok("mtx"):
+                error("mtx install failed. Disabling changer.")
+                cfg.set("changer", "enabled", "false")
+                pause()
+                return
+        else:
+            cfg.set("changer", "enabled", "false")
+            pause()
+            return
+
+    cfg.set("changer", "enabled", "true")
+
+    if changers:
+        changer_dev = changers[0]["sg"] if len(changers) == 1 else \
+            prompt("Changer device", default=changers[0]["sg"])
+    else:
+        changer_dev = prompt("Changer device", default="/dev/ch0")
+
+    cfg.set("changer", "device", changer_dev)
+
+    drive_count = str(len(drives)) if drives else "1"
+    drive_count = prompt("Number of drives", default=drive_count)
+    cfg.set("changer", "drive_count", drive_count)
+
+    # Query mtx for slot count
+    slot_count, ie_count = "24", "1"
+    out, _, rc = run(["mtx", "-f", changer_dev, "status"])
+    if rc == 0:
+        import re
+        storage = re.findall(r"Storage Element\s+(\d+)", out)
+        if storage:
+            slot_count = str(max(int(s) for s in storage))
+            info("Detected {} slots.".format(slot_count))
+        ie = re.findall(r"Import/Export Element\s+(\d+)", out)
+        ie_count = str(len(ie)) if ie else "1"
+
+    slot_count = prompt("Storage slot count", default=slot_count)
+    ie_count   = prompt("I/E slot count",     default=ie_count)
+
+    cfg.set("changer", "slot_count",    slot_count)
+    cfg.set("changer", "ie_slot_count", ie_count)
+    cfg.set("changer", "default_drive", "0")
+
+    info("Library: {} drives, {} slots, {} I/E".format(drive_count, slot_count, ie_count))
+    pause()
+
+def step_multi_drive(drives, cfg):
+    if len(drives) <= 1 or not cfg.getboolean("changer", "enabled", fallback=False):
+        return
+    header("Step 7 — Multi-Drive")
+    for i, d in enumerate(drives):
+        cfg.set("changer", "drive_{}_sg".format(i), d["sg"])
+        cfg.set("changer", "drive_{}_st".format(i), d["nst"])
+    info("{} drives registered.".format(len(drives)))
+    pause()
+
+def step_review_and_save(cfg):
+    header("Step 8 — Review & Save")
+
+    if RICH:
+        t = Table(box=box.SIMPLE_HEAVY, title="Configuration")
+        t.add_column("Setting", style="cyan")
+        t.add_column("Value")
+        for section in cfg.sections():
+            for key, val in cfg.items(section):
+                t.add_row("[{}] {}".format(section, key), val)
+        console.print(t)
+    else:
+        for section in cfg.sections():
+            print("  [{}]".format(section))
+            for key, val in cfg.items(section):
+                print("    {} = {}".format(key, val))
+            print()
+
+    print()
+    if confirm("Save to {}?".format(CONFIG_PATH), default=True):
+        Path(CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            cfg.write(f)
+        info("Config saved.")
+
+        try:
+            sys.path.insert(0, LIB_PATH)
+            import tapeman2_core as core
+            core.initialize(CONFIG_PATH)
+            info("Database and directories initialized.")
+        except Exception as e:
+            warn("Could not initialize: {}".format(e))
+    else:
+        warn("Not saved.")
+    pause()
+
+def step_done():
+    header("Setup Complete")
+    if RICH:
+        console.print(
+            "  [green bold]tapeman2 is ready on macOS.[/green bold]\n\n"
+            "  [bold]TUI:[/bold]    [cyan]tapeman2[/cyan]\n"
+            "  [bold]GUI:[/bold]    [cyan]tapeman2-gui[/cyan]  (run locally or via SSH -Y)\n"
+            "  [bold]Config:[/bold] [dim]{}[/dim]\n"
+            "  [bold]DB:[/bold]     [dim]/usr/local/var/tapeman2/archives.db[/dim]\n\n"
+            "  Re-run setup anytime: [cyan]tapeman2-setup[/cyan]\n".format(CONFIG_PATH)
+        )
+    else:
+        print("  tapeman2 ready.\n")
+        print("  tapeman2        — TUI")
+        print("  tapeman2-gui    — GUI")
+        print("  Config: {}".format(CONFIG_PATH))
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    if os.geteuid() != 0:
+        print("tapeman2-setup must be run as root (sudo tapeman2-setup).")
+        sys.exit(1)
+
+    cfg = configparser.ConfigParser()
+    for s in ["device", "paths", "archive", "changer", "ui"]:
+        cfg.add_section(s)
+    cfg.set("ui", "date_format", "%%Y-%%m-%%d %%H:%%M")
+    cfg.set("ui", "page_size",   "20")
+
+    step_welcome()
+    step_check_tools()
+    drives, changers = step_detect_devices()
+    step_configure_drive(drives, cfg)
+    step_configure_paths(cfg)
+    step_configure_archive(cfg)
+    step_configure_changer(drives, changers, cfg)
+    step_multi_drive(drives, cfg)
+    step_review_and_save(cfg)
+    step_done()
+
+if __name__ == "__main__":
+    main()

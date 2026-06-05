@@ -300,13 +300,33 @@ class ArchiveTab(ttk.Frame, LogMixin):
                         variable=self.var_tar).grid(row=row, column=0, columnspan=3,
                                                      sticky="w", pady=4)
 
-        # Direct write checkbox
+        # Direct write checkbox — ON by default
         row += 1
-        self.var_direct = tk.BooleanVar(value=False)
+        self.var_direct = tk.BooleanVar(value=True)
         ttk.Checkbutton(left,
-                        text="Direct write to tape (skip staging — use if source is on fast local disk)",
+                        text="Direct write to tape (streams source → tape directly)",
                         variable=self.var_direct).grid(row=row, column=0, columnspan=3,
                                                         sticky="w", pady=4)
+        row += 1
+        ttk.Label(left,
+                  text="Uncheck to stage first — better for network/slow sources "
+                       "or data that may change mid-archive.",
+                  style="Dim.TLabel", wraplength=520, justify="left").grid(
+                       row=row, column=0, columnspan=3, sticky="w", padx=(24,0))
+
+        # Full verification checkbox — ON by default
+        row += 1
+        self.var_full_verify = tk.BooleanVar(value=True)
+        ttk.Checkbutton(left,
+                        text="Full verification (read tape back and compare checksums)",
+                        variable=self.var_full_verify).grid(
+                            row=row, column=0, columnspan=3, sticky="w", pady=4)
+        row += 1
+        ttk.Label(left,
+                  text="Uncheck for fast mode — hash source during write, trust the "
+                       "drive's hardware verify. Run Verify later for a full tape check.",
+                  style="Dim.TLabel", wraplength=520, justify="left").grid(
+                       row=row, column=0, columnspan=3, sticky="w", padx=(24,0))
 
         # Dry run checkbox
         row += 1
@@ -360,6 +380,7 @@ class ArchiveTab(ttk.Frame, LogMixin):
             notes  = self.vars["notes"].get().strip()
             use_tar= self.var_tar.get()
             direct = self.var_direct.get()
+            verify_mode = "full" if self.var_full_verify.get() else "fast"
             dry    = self.var_dry.get()
 
             if not src or not name or not tape:
@@ -389,7 +410,7 @@ class ArchiveTab(ttk.Frame, LogMixin):
                 checksum_algo=ALGO, use_tar=use_tar,
                 lab=lab, pi=pi, notes=notes,
                 cfg=cfg, sg_device=SG, st_device=ST,
-                direct_write=direct,
+                direct_write=direct, verify_mode=verify_mode,
             )
             self.log("✔ Archive job submitted: {}".format(job["job_id"]))
             self.log("  Running in background — check the Jobs tab for progress.")

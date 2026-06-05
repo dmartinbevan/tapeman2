@@ -601,10 +601,41 @@ def do_archive():
     use_tar    = confirm(
         "Bundle as tar archive? (recommended for many small files)", default=TAR_DEF
     )
+
+    # Direct write defaults to ON. Explain when to stage instead.
+    if RICH:
+        console.print(
+            "\n  [bold]Write mode:[/bold]\n"
+            "  [green]Direct write[/green] streams data straight from the source to tape "
+            "(faster, no extra copy).\n"
+            "  Choose [yellow]No[/yellow] to stage via {} first — better when the source is "
+            "a [bold]network mount[/bold],\n"
+            "  a [bold]slow disk[/bold], or could [bold]change during the archive[/bold].\n".format(
+                STAGING))
+    else:
+        print("\n  Direct write streams source -> tape directly (faster).")
+        print("  Choose No to stage via {} first — better for network/slow".format(STAGING))
+        print("  sources or data that may change mid-archive.\n")
     direct     = confirm(
-        "Direct write to tape? (skip staging — use if source is on fast local disk)",
-        default=False
+        "Direct write to tape?", default=True
     )
+
+    # Verification mode. Full = read tape back and compare (slow, strongest).
+    # Fast = hash source during write, trust LTO hardware verify (much faster).
+    if RICH:
+        console.print(
+            "\n  [bold]Verification:[/bold]\n"
+            "  [green]Full[/green] reads the tape back and compares checksums "
+            "(slowest, strongest guarantee).\n"
+            "  [yellow]Fast[/yellow] hashes the source during write and trusts the "
+            "drive's hardware verify\n"
+            "  — much faster; you can run a full Verify later during idle time.\n")
+    else:
+        print("\n  Full verification reads tape back and compares (slow, strongest).")
+        print("  Fast hashes source during write, trusts drive hardware verify.")
+        print("  Fast archives can be fully verified later via the Verify menu.\n")
+    full_verify = confirm("Full verification (read back from tape)?", default=True)
+    verify_mode = "full" if full_verify else "fast"
 
     print()
 
@@ -645,7 +676,7 @@ def do_archive():
         checksum_algo=ALGO, use_tar=use_tar,
         lab=lab, pi=pi, notes=notes,
         cfg=cfg, sg_device=SG, st_device=ST,
-        direct_write=direct,
+        direct_write=direct, verify_mode=verify_mode,
     )
     print()
     if RICH:

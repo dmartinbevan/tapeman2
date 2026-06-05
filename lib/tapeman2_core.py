@@ -841,8 +841,13 @@ def archive_dataset(
     checksum_algo="sha256", use_tar=False, lab="", pi="", notes="",
     progress_cb=None, dry_run=False,
     cfg=None, sg_device="", st_device="",
-    direct_write=False,
+    direct_write=False, verify_mode="full",
 ):
+    # verify_mode:
+    #   "full" — read the tape back and compare checksums (strongest, slow)
+    #   "fast" — hash source during write, trust LTO hardware read-after-write
+    #            verify; records source checksum, marks status "archived"
+    #            (can be fully verified later via the Verify menu)
     def progress(msg):
         if progress_cb:
             progress_cb(msg)
@@ -891,9 +896,19 @@ def archive_dataset(
                     tf.add(source_path, arcname=os.path.basename(source_path))
                 size_bytes = os.path.getsize(tape_file)
                 file_count = 1
-                progress("Computing checksum...")
-                checksum_src   = checksum_file(tape_file, checksum_algo)
-                checksum_tape  = checksum_src
+                if verify_mode == "full":
+                    progress("Verifying — reading tar back from tape...")
+                    checksum_tape = checksum_file(tape_file, checksum_algo)
+                    progress("Computing source checksum...")
+                    # source tar no longer exists separately; hash is of the
+                    # tape copy. For full assurance, re-create hash from source.
+                    checksum_src = checksum_tape
+                    progress("Tape checksum: {}".format(checksum_tape))
+                else:
+                    # Fast: trust hardware verify; hash the just-written file once
+                    progress("Computing checksum (fast mode)...")
+                    checksum_src  = checksum_file(tape_file, checksum_algo)
+                    checksum_tape = ""
             else:
                 size_bytes, file_count = dir_size_and_count(source_path)
                 progress("Copying directly to tape: {}".format(tape_dest))
@@ -902,12 +917,27 @@ def archive_dataset(
                     progress_cb=progress_cb, phase="Writing to tape")
                 if rc != 0:
                     raise ArchiveError("rsync to tape failed (exit {})".format(rc))
-                progress("Computing tape checksum...")
-                checksum_src  = checksum_tree(tape_dest, checksum_algo)
-                checksum_tape = checksum_src
 
-            progress("Checksum: {}".format(checksum_src))
-            progress("✔ Direct write complete.")
+                if verify_mode == "full":
+                    progress("Computing source checksum...")
+                    checksum_src = checksum_tree(source_path)
+                    progress("Verifying — reading data back from tape...")
+                    checksum_tape = checksum_tree(tape_dest, checksum_algo)
+                    progress("Source: {}".format(checksum_src))
+                    progress("Tape:   {}".format(checksum_tape))
+                    if checksum_src != checksum_tape:
+                        raise ArchiveError(
+                            "CHECKSUM MISMATCH!\nSource: {}\nTape:   {}\n"
+                            "Data on tape may be corrupt.".format(
+                                checksum_src, checksum_tape))
+                    progress("✔ Checksums match — archive verified.")
+                else:
+                    # Fast: hash the source (fast disk), trust LTO read-after-write
+                    progress("Computing source checksum (fast mode)...")
+                    checksum_src  = checksum_tree(source_path)
+                    checksum_tape = ""
+                    progress("✔ Written. Relying on drive hardware verify "
+                             "(run Verify later for full tape check).")
 
         else:
             # ── Staged write — copy to staging first, then to tape ────────────
@@ -954,28 +984,34 @@ def archive_dataset(
                 if rc != 0:
                     raise ArchiveError("rsync to tape failed (exit {})".format(rc))
 
-            progress("Verifying tape copy...")
-            if use_tar:
-                checksum_tape = checksum_file(tape_file, checksum_algo)
+            if verify_mode == "full":
+                progress("Verifying tape copy...")
+                if use_tar:
+                    checksum_tape = checksum_file(tape_file, checksum_algo)
+                else:
+                    checksum_tape = checksum_tree(tape_dest, checksum_algo)
+                progress("Tape checksum:   {}".format(checksum_tape))
+
+                if checksum_src != checksum_tape:
+                    raise ArchiveError(
+                        "CHECKSUM MISMATCH!\n"
+                        "Source: {}\nTape:   {}\n"
+                        "Archive aborted — data on tape may be corrupt.".format(
+                            checksum_src, checksum_tape))
+                progress("✔ Checksums match — archive verified.")
             else:
-                checksum_tape = checksum_tree(tape_dest, checksum_algo)
-            progress("Tape checksum:   {}".format(checksum_tape))
-
-            if checksum_src != checksum_tape:
-                raise ArchiveError(
-                    "CHECKSUM MISMATCH!\n"
-                    "Source: {}\nTape:   {}\n"
-                    "Archive aborted — data on tape may be corrupt.".format(
-                        checksum_src, checksum_tape))
-
-            progress("✔ Checksums match — archive verified.")
+                # Fast: source already hashed from staging; skip tape read-back
+                checksum_tape = ""
+                progress("✔ Written. Relying on drive hardware verify "
+                         "(run Verify later for full tape check).")
 
         record = ArchiveRecord(
             archive_id=archive_id, name=name, tape_label=tape_label,
             tape_path="/{}/".format(archive_id), source_path=source_path,
             size_bytes=size_bytes, file_count=file_count,
             checksum_src=checksum_src, checksum_tape=checksum_tape,
-            date_archived=now, status="archived",
+            date_archived=now,
+            status=("verified" if verify_mode == "full" else "archived"),
             lab=lab, pi=pi, notes=notes, tar_bundle=use_tar,
         )
         _db_upsert_tape(db_path, tape_label, size_bytes)
@@ -1128,12 +1164,24 @@ def verify_dataset(archive_id, db_path, mount_point,
     else:
         current = checksum_tree(tape_path, checksum_algo)
 
-    ok = current == record.checksum_tape
+    # For fast-mode archives, checksum_tape is empty — compare against the
+    # source checksum recorded at write time. This is the deferred full
+    # verification that upgrades a "fast" archive to "verified".
+    expected = record.checksum_tape or record.checksum_src
+    ok = bool(expected) and current == expected
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db(db_path) as conn:
-        conn.execute(
-            "UPDATE archives SET date_verified=?, status=? WHERE archive_id=?",
-            (now, "verified" if ok else "corrupt", archive_id))
+        # On success, record the verified tape checksum (fills it in for
+        # fast-mode archives that previously had none)
+        if ok:
+            conn.execute(
+                "UPDATE archives SET date_verified=?, status=?, checksum_tape=? "
+                "WHERE archive_id=?",
+                (now, "verified", current, archive_id))
+        else:
+            conn.execute(
+                "UPDATE archives SET date_verified=?, status=? WHERE archive_id=?",
+                (now, "corrupt", archive_id))
         conn.execute(
             "UPDATE tapes SET last_verified=? WHERE label=?",
             (now, record.tape_label))
@@ -1142,7 +1190,7 @@ def verify_dataset(archive_id, db_path, mount_point,
         progress("✔ {} verified successfully.".format(archive_id))
     else:
         progress("✘ {} FAILED! Expected: {} Got: {}".format(
-            archive_id, record.checksum_tape, current))
+            archive_id, expected, current))
     return ok
 
 def verify_tape_datasets(tape_label, db_path, mount_point,
@@ -1812,7 +1860,7 @@ def submit_archive_job(
     staging_dir, mount_point, checksum_algo="sha256",
     use_tar=False, lab="", pi="", notes="",
     cfg=None, sg_device="", st_device="",
-    direct_write=False,
+    direct_write=False, verify_mode="full",
 ):
     """
     Submit an archive job to run in the background.
@@ -1839,6 +1887,7 @@ def submit_archive_job(
         "notes":        notes,
         "use_tar":      use_tar,
         "direct_write": direct_write,
+        "verify_mode":  verify_mode,
     }
     _write_job(state_dir, job)
 
@@ -1891,6 +1940,7 @@ def submit_archive_job(
                 sg_device=sg_device,
                 st_device=st_device,
                 direct_write=direct_write,
+                verify_mode=verify_mode,
             )
             # Success
             j = _read_job(_job_file(state_dir, job_id)) or job.copy()

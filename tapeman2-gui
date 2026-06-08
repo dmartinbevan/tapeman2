@@ -724,6 +724,8 @@ class JobsTab(ttk.Frame):
         ttk.Button(top, text="⟳ Refresh", command=self.refresh).pack(side="right")
         ttk.Button(top, text="Cancel Job",
                    command=self._cancel_job).pack(side="right", padx=(0,8))
+        ttk.Button(top, text="Resume Interrupted",
+                   command=self._resume_job).pack(side="right", padx=(0,8))
         ttk.Button(top, text="Clean Up Old Jobs",
                    command=self._cleanup).pack(side="right", padx=(0,8))
 
@@ -757,6 +759,7 @@ class JobsTab(ttk.Frame):
         self.tree.tag_configure("failed",    foreground=RED)
         self.tree.tag_configure("cancelled", foreground=FG_DIM)
         self.tree.tag_configure("queued",    foreground=YELLOW)
+        self.tree.tag_configure("interrupted", foreground=YELLOW)
 
         # Detail strip
         det = ttk.Frame(self, padding=(16,4))
@@ -836,6 +839,62 @@ class JobsTab(ttk.Frame):
         messagebox.showinfo("Cleanup",
             "Removed {} completed job file{}.".format(
                 removed, "s" if removed != 1 else ""))
+
+    def _resume_job(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Resume",
+                "Select an interrupted archive job to resume.")
+            return
+        job_id = sel[0]
+        job = core.get_job(STATE_DIR, job_id)
+        if not job or job.get("status") != core.JOB_STATUS_INTERRUPTED:
+            messagebox.showinfo("Resume",
+                "{} is not an interrupted archive job.".format(job_id))
+            return
+
+        if not core.is_mounted(MOUNT):
+            if messagebox.askyesno("Resume",
+                    "No tape mounted. Mount tape {} now?".format(
+                        job.get("tape_label",""))):
+                try:
+                    core.mount_tape(SG, MOUNT, st_device=ST)
+                except Exception as e:
+                    messagebox.showerror("Mount failed", str(e))
+                    return
+            else:
+                return
+
+        plan = core.plan_resume(job, MOUNT)
+        if not plan["ok"]:
+            messagebox.showerror("Cannot resume", plan["reason"])
+            return
+
+        msg = (
+            "Resume plan for {}\n\n"
+            "Source: {}\n"
+            "Archive: {}\n"
+            "Tape: {} (writable)\n\n"
+            "Source files: {}\n"
+            "Already on tape: {} ({})\n"
+            "Remaining: {} files ({})\n\n"
+            "Resume writes only the remaining files. Data written after the "
+            "last LTFS index sync but before the interruption may remain as "
+            "orphaned blocks on the tape.\n\nProceed?".format(
+                job_id, plan["source_path"], plan["archive_id"],
+                plan["tape_label"], plan["source_count"],
+                plan["on_tape_count"], core.human_size(plan["on_tape_bytes"]),
+                plan["remaining_count"], core.human_size(plan["remaining_bytes"])))
+
+        if messagebox.askyesno("Resume Archive", msg):
+            vmode = job.get("verify_mode", "full")
+            core.resume_archive_job(
+                STATE_DIR, job, DB, MOUNT,
+                checksum_algo=ALGO, cfg=cfg, sg_device=SG, st_device=ST,
+                verify_mode=vmode)
+            self.refresh()
+            messagebox.showinfo("Resume",
+                "Resume started for {} (running in background).".format(job_id))
 
     def _auto_refresh(self):
         self.refresh()

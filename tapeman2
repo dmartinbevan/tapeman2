@@ -829,7 +829,8 @@ def do_verify():
 
 def _job_status_color(status):
     return {"running":"cyan","complete":"green","failed":"red",
-            "cancelled":"dim","queued":"yellow"}.get(status,"white")
+            "cancelled":"dim","queued":"yellow",
+            "interrupted":"yellow"}.get(status,"white")
 
 def _job_elapsed(j):
     """Compute elapsed/duration string for a job."""
@@ -917,10 +918,11 @@ def do_jobs():
             ("1", "Refresh"),
             ("2", "Running jobs only"),
             ("3", "Completed jobs"),
-            ("4", "Failed jobs"),
+            ("4", "Failed / interrupted jobs"),
             ("5", "View job details"),
-            ("6", "Cancel a running job"),
-            ("7", "Clean up old completed jobs"),
+            ("6", "Resume an interrupted archive"),
+            ("7", "Cancel a running job"),
+            ("8", "Clean up old completed jobs"),
             ("b", "Back"),
         ])
         if choice == "1":
@@ -934,18 +936,24 @@ def do_jobs():
             show_jobs_table(core.list_jobs(STATE_DIR, status=core.JOB_STATUS_COMPLETE))
             pause()
         elif choice == "4":
-            header("Failed Jobs")
-            jobs = core.list_jobs(STATE_DIR, status=core.JOB_STATUS_FAILED)
-            show_jobs_table(jobs, "Failed")
-            for j in jobs:
+            header("Failed / Interrupted Jobs")
+            failed = core.list_jobs(STATE_DIR, status=core.JOB_STATUS_FAILED)
+            interrupted = core.list_jobs(STATE_DIR, status=core.JOB_STATUS_INTERRUPTED)
+            allj = interrupted + failed
+            show_jobs_table(allj, "Failed / Interrupted")
+            for j in allj:
                 if j.get("error"):
                     error("{}: {}".format(j["job_id"], j["error"]))
+            if interrupted:
+                info("Interrupted archive jobs can be resumed (option 6).")
             pause()
         elif choice == "5":
             job_id = prompt("Job ID to view").upper().strip()
             if job_id:
                 _show_job_detail(job_id)
         elif choice == "6":
+            _resume_interrupted()
+        elif choice == "7":
             job_id = prompt("Job ID to cancel").upper().strip()
             if job_id:
                 if core.cancel_job(STATE_DIR, job_id):
@@ -953,7 +961,7 @@ def do_jobs():
                 else:
                     error("Could not cancel {} — not running or not found.".format(job_id))
             pause()
-        elif choice == "7":
+        elif choice == "8":
             removed = core.cleanup_jobs(STATE_DIR, keep_days=7)
             info("Removed {} job file{}.".format(removed, "s" if removed != 1 else ""))
             pause()
@@ -997,6 +1005,119 @@ def _show_job_detail(job_id):
             print("  {:<12} {}".format(k + ":", v))
         if j.get("error"):
             print("\n  Error: {}".format(j["error"]))
+
+    # Show the job history log if present
+    log = j.get("log") or []
+    if log:
+        if RICH:
+            console.print("\n  [bold]History:[/bold]")
+            for line in log:
+                console.print("  [dim]{}[/dim]".format(line))
+        else:
+            print("\n  History:")
+            for line in log:
+                print("    {}".format(line))
+    pause()
+
+# ── Resume Interrupted Archive ────────────────────────────────────────────────
+
+def _resume_interrupted():
+    header("Resume Interrupted Archive")
+    jobs = core.interrupted_jobs(STATE_DIR)
+    if not jobs:
+        info("No interrupted archive jobs to resume.")
+        pause()
+        return
+
+    show_jobs_table(jobs, "Interrupted Archives")
+    print()
+    job_id = prompt("Job ID to resume (or blank to cancel)").upper().strip()
+    if not job_id:
+        return
+
+    job = core.get_job(STATE_DIR, job_id)
+    if not job or job.get("status") != core.JOB_STATUS_INTERRUPTED:
+        error("{} is not an interrupted archive job.".format(job_id))
+        pause()
+        return
+
+    # Ensure the target tape is mounted
+    if not core.is_mounted(MOUNT):
+        warn("No tape mounted. Mount tape {} first, then resume.".format(
+            job.get("tape_label", "")))
+        if confirm("Mount tape now?", default=True):
+            try:
+                core.mount_tape(SG, MOUNT, progress_cb=progress_msg, st_device=ST)
+            except Exception as e:
+                error("Mount failed: {}".format(e))
+                pause()
+                return
+        else:
+            return
+
+    info("Analyzing tape and source...")
+    plan = core.plan_resume(job, MOUNT)
+
+    if not plan["ok"]:
+        error(plan["reason"])
+        if not plan["tape_rw"] and core.is_mounted(MOUNT):
+            warn("If you want to start over, reformat the tape and run the "
+                 "archive again as a new job.")
+        pause()
+        return
+
+    # Show the plan
+    if RICH:
+        from rich.table import Table
+        from rich import box as rbox
+        t = Table(box=rbox.SIMPLE, show_header=False,
+                  title="Resume plan for {}".format(job_id))
+        t.add_column("Field", style="cyan", no_wrap=True)
+        t.add_column("Value")
+        t.add_row("Source",          plan["source_path"])
+        t.add_row("Archive ID",      plan["archive_id"])
+        t.add_row("Tape",            plan["tape_label"])
+        t.add_row("Tape writable",   "[green]yes[/green]")
+        t.add_row("Source files",    str(plan["source_count"]))
+        t.add_row("Already on tape", "{} ({})".format(
+            plan["on_tape_count"], core.human_size(plan["on_tape_bytes"])))
+        t.add_row("Remaining",       "[yellow]{} files ({})[/yellow]".format(
+            plan["remaining_count"], core.human_size(plan["remaining_bytes"])))
+        if plan["boundary_file"]:
+            t.add_row("Boundary file", "{} (re-checked / recopied if "
+                      "incomplete)".format(plan["boundary_file"]))
+        console.print(t)
+    else:
+        print("\n  Resume plan for {}:".format(job_id))
+        print("    Source:          {}".format(plan["source_path"]))
+        print("    Archive ID:      {}".format(plan["archive_id"]))
+        print("    Tape:            {} (writable)".format(plan["tape_label"]))
+        print("    Source files:    {}".format(plan["source_count"]))
+        print("    Already on tape: {} ({})".format(
+            plan["on_tape_count"], core.human_size(plan["on_tape_bytes"])))
+        print("    Remaining:       {} files ({})".format(
+            plan["remaining_count"], core.human_size(plan["remaining_bytes"])))
+
+    if plan["remaining_count"] == 0:
+        info("Nothing remaining — all source files appear already on tape.")
+        if not confirm("Re-run verification and mark complete?", default=True):
+            return
+
+    print()
+    info("Resume writes only the remaining files (rsync skips what's already "
+         "present). Data written after the last LTFS index sync but before the "
+         "interruption may remain as orphaned blocks on the tape.")
+    if not confirm("Proceed with resume?", default=True):
+        return
+
+    # Determine verify mode (default to the job's original, else full)
+    vmode = job.get("verify_mode", "full")
+    core.resume_archive_job(
+        STATE_DIR, job, DB, MOUNT,
+        checksum_algo=ALGO, cfg=cfg, sg_device=SG, st_device=ST,
+        verify_mode=vmode)
+    info("Resume started for {} (running in background).".format(job_id))
+    info("Watch progress in the Jobs view.")
     pause()
 
 # ── Inventory ─────────────────────────────────────────────────────────────────

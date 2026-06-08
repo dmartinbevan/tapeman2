@@ -335,6 +335,22 @@ def run_cmd(cmd, timeout=300):
 def is_mounted(mount_point):
     return _get_platform().is_mounted(mount_point)
 
+def _mount_is_writable(mount_point):
+    """
+    Test whether a mounted tape is writable (not remounted read-only).
+    Attempts to create and remove a tiny temp file. Returns True/False.
+    """
+    if not is_mounted(mount_point):
+        return False
+    probe = os.path.join(mount_point, ".tapeman2_write_test")
+    try:
+        with open(probe, "w") as f:
+            f.write("t")
+        os.remove(probe)
+        return True
+    except (OSError, IOError):
+        return False
+
 def mount_tape(sg_device, mount_point, progress_cb=None, st_device=None):
     _get_platform().mount_tape(sg_device, mount_point, progress_cb,
                                st_device=st_device)
@@ -1227,6 +1243,22 @@ def _db_insert_archive(db_path, rec):
             rec.date_archived, rec.status
         ))
 
+def _db_update_archive(db_path, rec):
+    """Update an existing archive row (used when resuming in place)."""
+    with get_db(db_path) as conn:
+        conn.execute("""
+            UPDATE archives SET
+                name=?, lab=?, pi=?, notes=?, source_path=?, tape_label=?,
+                tape_path=?, tar_bundle=?, size_bytes=?, file_count=?,
+                checksum_src=?, checksum_tape=?, date_archived=?, status=?
+            WHERE archive_id=?
+        """, (
+            rec.name, rec.lab, rec.pi, rec.notes, rec.source_path,
+            rec.tape_label, rec.tape_path, 1 if rec.tar_bundle else 0,
+            rec.size_bytes, rec.file_count, rec.checksum_src, rec.checksum_tape,
+            rec.date_archived, rec.status, rec.archive_id
+        ))
+
 def _db_upsert_tape(db_path, label, added_bytes):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db(db_path) as conn:
@@ -1595,6 +1627,7 @@ JOB_STATUS_RUNNING   = "running"
 JOB_STATUS_COMPLETE  = "complete"
 JOB_STATUS_FAILED    = "failed"
 JOB_STATUS_CANCELLED = "cancelled"
+JOB_STATUS_INTERRUPTED = "interrupted"   # died mid-run; archive jobs can resume
 
 def _jobs_dir(state_dir):
     return os.path.join(state_dir, "jobs")
@@ -1639,6 +1672,15 @@ def _extract_percent(msg):
             return None
     return None
 
+def _append_job_log(job, line):
+    """Append a timestamped line to a job's in-record history log."""
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = "[{}] {}".format(ts, line)
+    log = job.get("log") or []
+    log.append(entry)
+    job["log"] = log
+    return job
+
 def list_jobs(state_dir, status=None):
     """Return list of all job dicts, optionally filtered by status."""
     jdir = _jobs_dir(state_dir)
@@ -1655,9 +1697,19 @@ def list_jobs(state_dir, status=None):
                             try:
                                 os.kill(pid, 0)
                             except OSError:
-                                # Process is gone — mark as failed
-                                job["status"] = JOB_STATUS_FAILED
-                                job["error"]  = "Process terminated unexpectedly"
+                                # Process is gone. Archive jobs that die
+                                # partway are "interrupted" (resumable);
+                                # everything else is "failed".
+                                if job.get("type") == "archive":
+                                    job["status"] = JOB_STATUS_INTERRUPTED
+                                    job["error"]  = ("Process ended before "
+                                        "completion (interrupted). May be resumable.")
+                                    _append_job_log(job,
+                                        "Detected interrupted — process {} no "
+                                        "longer running.".format(pid))
+                                else:
+                                    job["status"] = JOB_STATUS_FAILED
+                                    job["error"]  = "Process terminated unexpectedly"
                                 _write_job(state_dir, job)
                     if status is None or job.get("status") == status:
                         jobs.append(job)
@@ -1713,6 +1765,267 @@ def cleanup_jobs(state_dir, keep_days=7):
 
 def active_job_count(state_dir):
     return len(list_jobs(state_dir, status=JOB_STATUS_RUNNING))
+
+def interrupted_jobs(state_dir):
+    """Return archive jobs in the interrupted (resumable) state."""
+    return [j for j in list_jobs(state_dir, status=JOB_STATUS_INTERRUPTED)
+            if j.get("type") == "archive"]
+
+# ── Resume Interrupted Archive ────────────────────────────────────────────────
+
+def plan_resume(job, mount_point):
+    """
+    Analyze an interrupted archive job and build a resume plan.
+    Returns a dict:
+      {ok, reason, tape_rw, on_tape_count, source_count, remaining_count,
+       on_tape_bytes, remaining_bytes, boundary_file, boundary_ok,
+       source_path, archive_id, tape_label}
+    Does not modify anything — purely inspects.
+    """
+    plan = {
+        "ok": False, "reason": "", "tape_rw": False,
+        "on_tape_count": 0, "source_count": 0, "remaining_count": 0,
+        "on_tape_bytes": 0, "remaining_bytes": 0,
+        "boundary_file": None, "boundary_ok": None,
+        "source_path": job.get("source_path", ""),
+        "archive_id": job.get("archive_id"),
+        "tape_label": job.get("tape_label", ""),
+    }
+
+    source = job.get("source_path", "")
+    if not source or not os.path.exists(source):
+        plan["reason"] = ("Source path is not available: {}. "
+            "Cannot resume — the original source must be present.".format(source))
+        return plan
+
+    if not is_mounted(mount_point):
+        plan["reason"] = "No tape mounted. Mount the target tape and try again."
+        return plan
+
+    # Read-only check — the hard guardrail. An interrupted tape often
+    # remounts read-only, in which case resume is impossible.
+    if not _mount_is_writable(mount_point):
+        plan["reason"] = ("Tape is mounted READ-ONLY (likely due to the "
+            "interruption). Resume is not possible. You can reformat and "
+            "restart the archive instead.")
+        plan["tape_rw"] = False
+        return plan
+    plan["tape_rw"] = True
+
+    # tar bundles can't be partially resumed — it's one atomic file
+    if job.get("use_tar"):
+        plan["reason"] = ("This archive was a tar bundle (single file) — "
+            "it can't be partially resumed. Restart it instead.")
+        return plan
+
+    archive_id = job.get("archive_id")
+    # The archive_id may not have been assigned if it died very early.
+    if not archive_id:
+        plan["reason"] = ("This job was interrupted before writing began — "
+            "just run it again as a new archive.")
+        return plan
+
+    tape_dir = os.path.join(mount_point, archive_id)
+    if not os.path.exists(tape_dir):
+        plan["reason"] = ("No data found on tape for {} — nothing was written "
+            "before the interruption. Run the archive again.".format(archive_id))
+        return plan
+
+    # Build the set of files already on tape (relative path -> size)
+    on_tape = {}
+    for root, _dirs, files in os.walk(tape_dir):
+        for fn in files:
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, tape_dir)
+            try:
+                on_tape[rel] = os.path.getsize(full)
+            except OSError:
+                on_tape[rel] = -1
+
+    # Build the source file set. The archive copies source/* directly into
+    # ARCH-XXXX/ (rsync "source/" -> "tape_dest/"), so paths on tape are
+    # relative to the source root with NO extra basename prefix.
+    source_files = {}
+    for root, _dirs, files in os.walk(source):
+        for fn in files:
+            full = os.path.join(root, fn)
+            rel = os.path.relpath(full, source)
+            try:
+                source_files[rel] = os.path.getsize(full)
+            except OSError:
+                source_files[rel] = -1
+
+    plan["source_count"] = len(source_files)
+    plan["on_tape_count"] = len(on_tape)
+    plan["on_tape_bytes"] = sum(s for s in on_tape.values() if s > 0)
+
+    # Remaining = in source but not validly on tape (missing, or size mismatch)
+    remaining = []
+    for rel, ssize in source_files.items():
+        tsize = on_tape.get(rel)
+        if tsize is None or tsize != ssize:
+            remaining.append(rel)
+
+    # Boundary file: the most-recently-written tape file is the one most
+    # likely truncated by the interruption. Identify the newest by mtime.
+    newest_rel, newest_mtime = None, -1
+    for rel in on_tape:
+        full = os.path.join(tape_dir, rel)
+        try:
+            mt = os.path.getmtime(full)
+            if mt > newest_mtime:
+                newest_mtime, newest_rel = mt, rel
+        except OSError:
+            pass
+    plan["boundary_file"] = newest_rel
+
+    plan["remaining_count"] = len(remaining)
+    plan["remaining_bytes"] = sum(
+        s for r, s in source_files.items() if r in set(remaining) and s > 0)
+    plan["_remaining_list"] = remaining
+    plan["ok"] = True
+    plan["reason"] = "Ready to resume."
+    return plan
+
+def resume_archive_job(state_dir, job, db_path, mount_point,
+                       checksum_algo="sha256", cfg=None,
+                       sg_device="", st_device="", verify_mode="full"):
+    """
+    Resume an interrupted archive in place (same job ID).
+    rsync naturally skips files already present and identical, copying only
+    the remainder — including rewriting any partially-written boundary file
+    (size mismatch triggers recopy). Records the resume in the job log.
+    Returns the job dict; runs the work in a forked background process.
+    """
+    job_id     = job["job_id"]
+    source     = job["source_path"]
+    archive_id = job.get("archive_id")
+    tape_label = job.get("tape_label", "")
+    name       = job.get("name", "")
+    lab        = job.get("lab", "")
+    pi         = job.get("pi", "")
+    notes      = job.get("notes", "")
+
+    # Reset the job to running, in place, with a log note
+    job["status"]   = JOB_STATUS_RUNNING
+    job["error"]    = None
+    job["finished"] = None
+    job["resumed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    job["resume_count"] = job.get("resume_count", 0) + 1
+    _append_job_log(job,
+        "Resumed in place (attempt #{}). Source={}, tape={}, archive={}.".format(
+            job["resume_count"], source, tape_label, archive_id))
+    job["progress"] = "Resuming..."
+    _write_job(state_dir, job)
+
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setsid()
+        except Exception:
+            pass
+        devnull = open(os.devnull, "r+")
+        os.dup2(devnull.fileno(), 0)
+        os.dup2(devnull.fileno(), 1)
+        os.dup2(devnull.fileno(), 2)
+
+        def progress_cb(msg):
+            jj = _read_job(_job_file(state_dir, job_id)) or job.copy()
+            jj["progress"] = msg
+            jj["status"]   = JOB_STATUS_RUNNING
+            jj["pid"]      = os.getpid()
+            _pct = _extract_percent(msg)
+            if _pct is not None:
+                jj["percent"] = _pct
+            _write_job(state_dir, jj)
+
+        jj = _read_job(_job_file(state_dir, job_id)) or job.copy()
+        jj["pid"] = os.getpid()
+        _write_job(state_dir, jj)
+
+        try:
+            tape_dest = os.path.join(mount_point, archive_id)
+            Path(tape_dest).mkdir(parents=True, exist_ok=True)
+            progress_cb("Resuming write — rsync will skip completed files...")
+            # rsync -a skips files already present and identical; size/mtime
+            # mismatch (e.g. a truncated boundary file) forces recopy. This is
+            # exactly the resume behavior we want, safely.
+            rc = _rsync_with_progress(
+                source + "/", tape_dest + "/",
+                progress_cb=progress_cb, phase="Resuming to tape")
+            if rc != 0:
+                raise ArchiveError("rsync resume failed (exit {})".format(rc))
+
+            size_bytes, file_count = dir_size_and_count(tape_dest)
+
+            if verify_mode == "full":
+                progress_cb("Computing source checksum...")
+                checksum_src = checksum_tree(source)
+                progress_cb("Verifying — reading data back from tape...")
+                checksum_tape = checksum_tree(tape_dest, checksum_algo)
+                if checksum_src != checksum_tape:
+                    raise ArchiveError(
+                        "CHECKSUM MISMATCH after resume!\nSource: {}\nTape: {}".format(
+                            checksum_src, checksum_tape))
+                progress_cb("✔ Checksums match — resumed archive verified.")
+                final_status = "verified"
+            else:
+                progress_cb("Computing source checksum (fast mode)...")
+                checksum_src  = checksum_tree(source)
+                checksum_tape = ""
+                final_status = "archived"
+
+            # Upsert the archive record (it may already exist from the first run)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            existing = get_archive(db_path, archive_id)
+            record = ArchiveRecord(
+                archive_id=archive_id, name=name, tape_label=tape_label,
+                tape_path="/{}/".format(archive_id), source_path=source,
+                size_bytes=size_bytes, file_count=file_count,
+                checksum_src=checksum_src, checksum_tape=checksum_tape,
+                date_archived=(existing.date_archived if existing else now),
+                status=final_status, lab=lab, pi=pi, notes=notes,
+                tar_bundle=False,
+            )
+            _db_upsert_tape(db_path, tape_label, size_bytes)
+            if existing:
+                _db_update_archive(db_path, record)
+            else:
+                _db_insert_archive(db_path, record)
+
+            try:
+                record_manifest(db_path, archive_id, tape_label, tape_dest)
+            except Exception:
+                pass
+
+            jj = _read_job(_job_file(state_dir, job_id)) or job.copy()
+            jj["status"]     = JOB_STATUS_COMPLETE
+            jj["archive_id"] = archive_id
+            jj["progress"]   = "Complete (resumed) — {}".format(archive_id)
+            jj["percent"]    = 100
+            jj["finished"]   = now
+            _append_job_log(jj,
+                "Resume completed: {} files, {}, status={}.".format(
+                    file_count, human_size(size_bytes), final_status))
+            _write_job(state_dir, jj)
+            notify_job_complete(cfg, jj)
+        except Exception as e:
+            jj = _read_job(_job_file(state_dir, job_id)) or job.copy()
+            jj["status"]   = JOB_STATUS_INTERRUPTED
+            jj["error"]    = str(e)
+            jj["progress"] = "Resume failed: {}".format(str(e)[:80])
+            jj["finished"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            _append_job_log(jj, "Resume attempt failed: {}".format(e))
+            _write_job(state_dir, jj)
+            notify_job_complete(cfg, jj)
+        finally:
+            os._exit(0)
+    else:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except Exception:
+            pass
+        return job
 
 # ── Job Queue (sequential execution) ──────────────────────────────────────────
 

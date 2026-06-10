@@ -1138,7 +1138,6 @@ class TapeTab(ttk.Frame, LogMixin):
             self.progress.stop()
 
     @run_in_thread
-    @run_in_thread
     def _unmount(self):
         self.progress.start()
         self.log_clear()
@@ -1148,8 +1147,12 @@ class TapeTab(ttk.Frame, LogMixin):
         try:
             core.unmount_tape(MOUNT, progress_cb=self.log)
             self.log("✔ Unmounted.")
-            core.eject_tape(ST)
-            self.log("✔ Tape ejected.")
+            self.log("Ejecting (rewinding may take a moment)...")
+            ok, msg = core.eject_tape(ST, sg_device=SG, mount_point=MOUNT)
+            if ok:
+                self.log("✔ " + msg)
+            else:
+                self.log("⚠ " + msg)
             self.app._refresh_status()
             # Show cleaning warning after successful eject
             if needs_clean:

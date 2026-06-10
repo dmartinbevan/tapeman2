@@ -362,8 +362,11 @@ def _unmount_tape():
     if not core.is_mounted(MOUNT):
         warn("No tape is currently mounted.")
         if confirm("Eject tape anyway?", default=False):
-            core.eject_tape(ST)
-            info("Tape ejected.")
+            ok, msg = core.eject_tape(ST, sg_device=SG, mount_point=MOUNT)
+            if ok:
+                info(msg)
+            else:
+                error(msg)
         pause()
         return
 
@@ -393,8 +396,12 @@ def _unmount_tape():
         core.unmount_tape(MOUNT, progress_cb=progress_msg)
         info("Tape unmounted.")
         if confirm("Eject the tape?", default=True):
-            core.eject_tape(ST)
-            info("Tape ejected. Safe to remove.")
+            info("Ejecting (rewinding may take a moment)...")
+            ok, msg = core.eject_tape(ST, sg_device=SG, mount_point=MOUNT)
+            if ok:
+                info(msg + " Safe to remove.")
+            else:
+                error(msg)
     except core.TapeError as e:
         error(str(e))
         pause()

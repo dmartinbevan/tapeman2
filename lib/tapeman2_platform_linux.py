@@ -65,8 +65,42 @@ def unmount_tape(mount_point, progress_cb=None):
     if is_mounted(mount_point):
         raise RuntimeError("Failed to unmount tape:\n{}".format(result.stderr))
 
-def eject_tape(st_device):
-    run_cmd(["mt", "-f", st_device, "offline"], timeout=30)
+def eject_tape(st_device, sg_device=None):
+    """
+    Rewind and eject (unload) the tape. Returns (ok, message).
+    'mt offline' rewinds then unloads, which can take a while on a full tape,
+    so we allow a generous timeout. Falls back to a SCSI unload if mt fails.
+    """
+    # mt offline rewinds + unloads. Rewind from end-of-tape can take minutes,
+    # so give it real time rather than the default short timeout.
+    result = run_cmd(["mt", "-f", st_device, "offline"], timeout=300)
+    if result.returncode == 0:
+        return True, "Tape ejected."
+
+    err = (result.stderr or result.stdout or "").strip()
+
+    # Fallback: try a direct SCSI load/unload via sg_start --eject
+    if sg_device:
+        alt = run_cmd(["sg_start", "--eject", sg_device], timeout=300)
+        if alt.returncode == 0:
+            return True, "Tape ejected (via SCSI unload)."
+        err = err or (alt.stderr or alt.stdout or "").strip()
+
+    # Common, diagnosable failure reasons
+    low = err.lower()
+    if "device or resource busy" in low or "busy" in low:
+        return False, ("Eject failed — drive is busy. The tape may still be "
+                       "mounted or in use. Unmount first, then eject.")
+    if "timeout" in low:
+        return False, ("Eject timed out — the drive may still be rewinding. "
+                       "Wait a moment and check the drive, or try again.")
+    if "no medium" in low or "no tape" in low:
+        return False, "No tape loaded in the drive."
+    if "permission" in low or "denied" in low:
+        return False, ("Eject failed — permission denied on {}. "
+                       "Check device permissions.".format(st_device))
+    return False, ("Eject failed: {}".format(err) if err
+                   else "Eject failed (no error detail from drive).")
 
 def tape_status(st_device):
     result = run_cmd(["mt", "-f", st_device, "status"], timeout=10)

@@ -57,9 +57,6 @@ def _mount_tape(sg_device, mount_point, progress_cb=None):
 def _unmount_tape(mount_point, progress_cb=None):
     _get_platform().unmount_tape(mount_point, progress_cb)
 
-def _eject_tape(st_device):
-    _get_platform().eject_tape(st_device)
-
 def _tape_status(st_device):
     return _get_platform().tape_status(st_device)
 
@@ -358,8 +355,20 @@ def mount_tape(sg_device, mount_point, progress_cb=None, st_device=None):
 def unmount_tape(mount_point, progress_cb=None):
     _get_platform().unmount_tape(mount_point, progress_cb)
 
-def eject_tape(st_device):
-    _get_platform().eject_tape(st_device)
+def eject_tape(st_device, sg_device=None, mount_point=None):
+    """
+    Eject the tape. Returns (ok, message). If a mount_point is given, ensures
+    the tape isn't still LTFS-mounted first — a live FUSE mount holds the
+    device open and will block or fail the eject.
+    """
+    if mount_point and is_mounted(mount_point):
+        return (False,
+                "Tape is still mounted at {}. Unmount it before ejecting.".format(
+                    mount_point))
+    result = _get_platform().eject_tape(st_device, sg_device)
+    if isinstance(result, tuple):
+        return result
+    return True, "Tape ejected."
 
 def format_tape(sg_device, serial, volume_name="", progress_cb=None):
     """
@@ -545,9 +554,12 @@ def smart_unmount(mount_point, st_device, sg_device, cfg, db_path,
         changer_unload(changer_dev, drive=0, db_path=db_path,
                        progress_cb=progress_cb)
     elif eject:
-        eject_tape(st_device)
+        ok, msg = eject_tape(st_device, sg_device=sg_device)
         if progress_cb:
-            progress_cb("Tape ejected. Safe to remove.")
+            if ok:
+                progress_cb(msg + " Safe to remove.")
+            else:
+                progress_cb("⚠ " + msg)
 
 # ── Filesystem Helpers ────────────────────────────────────────────────────────
 

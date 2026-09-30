@@ -1637,22 +1637,30 @@ def _check_permissions():
     With world-accessible devices (mode 0666) any user can run tapeman2.
     Falls back to checking tape group membership for stricter setups.
     """
-    import grp
     if os.geteuid() == 0:
         return  # root always OK
 
     sg = cfg.get("device", "sg_device", fallback="/dev/sg0")
 
+    # Device access is only checkable for real /dev nodes (Linux, or a macOS
+    # setup that exposes /dev paths). The macOS IBM/HPE LTFS iokit backend
+    # addresses the drive by a bare number (e.g. "0") with no device file, so
+    # there's nothing to chmod or check — LTFS mediates access itself. Skip
+    # the check in that case.
+    if not str(sg).startswith("/dev/"):
+        return
+
     # Check direct device access first (works if device is 0666)
     if os.access(sg, os.R_OK | os.W_OK):
         return
 
-    # Fall back: check tape group membership
+    # Fall back: check tape group membership (Linux only)
     try:
+        import grp
         tape_gid = grp.getgrnam("tape").gr_gid
         if tape_gid in os.getgroups():
             return
-    except KeyError:
+    except (KeyError, ImportError):
         pass
 
     # Permission denied — give helpful message

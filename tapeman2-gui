@@ -1635,17 +1635,21 @@ class LogTab(ttk.Frame):
 # ── Entry Point ───────────────────────────────────────────────────────────────
 
 def _check_permissions():
-    import grp
     if os.geteuid() == 0:
         return
     sg = cfg.get("device", "sg_device", fallback="/dev/sg0")
+    # macOS IBM/HPE LTFS iokit backend uses a bare device number with no
+    # device file — nothing to check or chmod; LTFS mediates access.
+    if not str(sg).startswith("/dev/"):
+        return
     if os.access(sg, os.R_OK | os.W_OK):
         return
     try:
+        import grp
         tape_gid = grp.getgrnam("tape").gr_gid
         if tape_gid in os.getgroups():
             return
-    except KeyError:
+    except (KeyError, ImportError):
         pass
     try:
         import tkinter.messagebox as mb

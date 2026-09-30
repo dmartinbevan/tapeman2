@@ -85,23 +85,35 @@ def tape_ready_progress(sg_device):
             return None
     return None
 
+def _mt_usable(st_device):
+    """
+    mt only works against a real /dev tape node. On the macOS IBM/HPE LTFS
+    iokit backend the device is a bare number (e.g. "0") with no /dev node,
+    so mt does not apply. Treat mt as usable only for /dev/* paths.
+    """
+    return check_tool("mt") and str(st_device).startswith("/dev/")
+
 def tape_drive_state(st_device, sg_device=None):
     """
-    Returns (state, message). macOS uses mt status; sg_turs if available.
-    States: ready | initializing | no_tape | not_ready | unknown
+    Returns (state, message).
+    On macOS the IBM/HPE LTFS backend addresses the drive by a device number
+    and provides no mt/sg device node, so mt-based status often doesn't apply.
+    We use mt when it's a real /dev node, sg_turs when sg3_utils is present,
+    and otherwise report READY (LTFS surfaces real problems at mount time).
     """
-    result = run_cmd(["mt", "-f", st_device, "status"], timeout=10)
-    if result.returncode == 0:
-        out = result.stdout.upper()
-        if "DR_OPEN" in out and "ONLINE" not in out:
-            return TAPE_STATE_NO_TAPE, "No tape loaded in drive"
-        if "ONLINE" in out:
-            return TAPE_STATE_READY, "Tape ready"
-        if "NOT READY" in out:
-            return TAPE_STATE_NOT_READY, "Drive not ready"
+    if _mt_usable(st_device):
+        result = run_cmd(["mt", "-f", st_device, "status"], timeout=10)
+        if result.returncode == 0:
+            out = result.stdout.upper()
+            if "DR_OPEN" in out and "ONLINE" not in out:
+                return TAPE_STATE_NO_TAPE, "No tape loaded in drive"
+            if "ONLINE" in out:
+                return TAPE_STATE_READY, "Tape ready"
+            if "NOT READY" in out:
+                return TAPE_STATE_NOT_READY, "Drive not ready"
 
-    # sg_turs if sg3_utils installed (brew)
-    if sg_device and check_tool("sg_turs"):
+    # sg_turs if sg3_utils installed (brew) and we have a usable sg path
+    if sg_device and check_tool("sg_turs") and str(sg_device).startswith("/dev/"):
         result = run_cmd(["sg_turs", "-v", sg_device], timeout=10)
         text = (result.stdout + result.stderr).lower()
         if result.returncode != 0:
@@ -123,7 +135,10 @@ def tape_drive_state(st_device, sg_device=None):
             return TAPE_STATE_NOT_READY, "Drive not ready"
         return TAPE_STATE_READY, "Tape ready"
 
-    return TAPE_STATE_UNKNOWN, "Could not determine drive state"
+    # No mt/sg device node available (typical for the macOS iokit LTFS
+    # backend). Assume ready — LTFS reports actual load/format problems when
+    # we attempt to mount.
+    return TAPE_STATE_READY, "Tape ready (LTFS will report load status at mount)"
 
 def wait_for_tape_ready(st_device, sg_device=None,
                          timeout_minutes=40, progress_cb=None):
@@ -270,16 +285,24 @@ def unmount_tape(mount_point, progress_cb=None):
 
 def eject_tape(st_device, sg_device=None):
     """
-    Rewind and eject the tape on macOS. Returns (ok, message).
-    Rewind from end-of-tape can be slow, so allow a generous timeout.
+    Eject the tape on macOS. Returns (ok, message).
+    With the IBM/HPE LTFS iokit backend there is no mt device node, so mt
+    won't apply — in that case, once the tape is unmounted the physical
+    eject is done via the drive button or the LTFS/vendor tool. We try mt
+    and sg_start when usable, and otherwise report that unmount is complete
+    and the tape can be removed.
     """
-    result = run_cmd(["mt", "-f", st_device, "offline"], timeout=300)
-    if result.returncode == 0:
-        return True, "Tape ejected."
+    # mt only works on a real /dev node
+    if _mt_usable(st_device):
+        result = run_cmd(["mt", "-f", st_device, "offline"], timeout=300)
+        if result.returncode == 0:
+            return True, "Tape ejected."
+        err = (result.stderr or result.stdout or "").strip()
+    else:
+        err = ""
 
-    err = (result.stderr or result.stdout or "").strip()
-    # Fallback: SCSI unload via sg_start if sg3_utils is present
-    if sg_device and check_tool("sg_start"):
+    # SCSI unload via sg_start if sg3_utils present and a usable sg path
+    if sg_device and check_tool("sg_start") and str(sg_device).startswith("/dev/"):
         alt = run_cmd(["sg_start", "--eject", sg_device], timeout=300)
         if alt.returncode == 0:
             return True, "Tape ejected (via SCSI unload)."
@@ -287,14 +310,17 @@ def eject_tape(st_device, sg_device=None):
 
     low = err.lower()
     if "busy" in low:
-        return False, ("Eject failed — drive is busy. Unmount the tape first.")
+        return False, "Eject failed — drive is busy. Unmount the tape first."
     if "timeout" in low:
         return False, ("Eject timed out — the drive may still be rewinding. "
                        "Wait a moment and try again.")
     if "no medium" in low or "no tape" in low:
         return False, "No tape loaded in the drive."
-    return False, ("Eject failed: {}".format(err) if err
-                   else "Eject failed (no error detail from drive).")
+    if err:
+        return False, "Eject failed: {}".format(err)
+    # No usable mt/sg control node — unmount already succeeded upstream
+    return True, ("Tape unmounted. Use the drive's eject button or your LTFS "
+                  "tool to physically unload the cartridge.")
 
 def tape_status(st_device):
     result = run_cmd(["mt", "-f", st_device, "status"], timeout=10)
@@ -367,6 +393,13 @@ def cleaning_status_str(sg_device, st_device=None) -> Tuple[bool, str]:
 def detect_tape_drives() -> List[Dict]:
     drives = []
 
+    # Method 0 (preferred): ask LTFS directly. On macOS the IBM/HPE LTFS
+    # backend addresses drives by a device NUMBER (e.g. "0"), not a /dev
+    # path — this is the string that must be passed to `ltfs -o devname=`.
+    drives = _detect_via_ltfs_device_list()
+    if drives:
+        return drives
+
     # Method 1: system_profiler
     drives = _detect_via_system_profiler()
     if drives:
@@ -379,6 +412,47 @@ def detect_tape_drives() -> List[Dict]:
 
     # Method 3: /dev scan
     return _detect_via_dev_scan()
+
+def _detect_via_ltfs_device_list() -> List[Dict]:
+    """
+    Parse `ltfs -o device_list`. This is the authoritative source on macOS
+    for the device string LTFS expects. Output lines look like:
+      Device Name = 0, Vendor ID = IBM, Product ID = ULTRIUM-HH9,
+      Serial Number = 1097006950, Product Name =[ULTRIUM-HH9].
+    Returns drives with sg/st set to the LTFS device number.
+    """
+    drives = []
+    if not check_tool("ltfs"):
+        return drives
+    result = run_cmd(["ltfs", "-o", "device_list"], timeout=30)
+    text = result.stdout + result.stderr
+    for line in text.splitlines():
+        if "Device Name" not in line:
+            continue
+        # Extract the device name (number) and model
+        m_dev = re.search(r"Device Name\s*=\s*([^,]+)", line)
+        m_ven = re.search(r"Vendor ID\s*=\s*([^,]+)", line)
+        m_prod = re.search(r"Product ID\s*=\s*([^,]+)", line)
+        m_ser = re.search(r"Serial Number\s*=\s*([^,]+)", line)
+        if not m_dev:
+            continue
+        dev = m_dev.group(1).strip()
+        vendor = (m_ven.group(1).strip() if m_ven else "").strip()
+        product = (m_prod.group(1).strip() if m_prod else "").strip()
+        serial = (m_ser.group(1).strip() if m_ser else "").strip()
+        model = (vendor + " " + product).strip() or "Tape Drive"
+        # On macOS the same device number is used for ltfs (sg role) and,
+        # for mt-style control, there is typically no /dev node — so we set
+        # st to the same identifier; mt commands may not apply on this backend.
+        drives.append({
+            "sg":     dev,
+            "st":     dev,
+            "nst":    dev,
+            "model":  model,
+            "serial": serial,
+            "index":  dev,
+        })
+    return drives
 
 def _detect_via_system_profiler() -> List[Dict]:
     drives = []
